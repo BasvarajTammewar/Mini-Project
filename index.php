@@ -1,3 +1,6 @@
+
+
+
 <?php
 /**
  * CareerAct - Entry Point
@@ -10,10 +13,12 @@ require_once __DIR__ . '/includes/helpers.php';
 initSession();
 
 if (isUserLoggedIn()) {
-    if (($_SESSION['role_code'] ?? '') === 'admin') {
+    if (isAdmin()) {
         header('Location: admin/dashboard.php');
-    } else {
+    } elseif (isStudentProfileCompleted()) {
         header('Location: dashboard.php');
+    } else {
+        header('Location: onboarding.php?msg=complete_profile');
     }
 } else {
     header('Location: login.php');

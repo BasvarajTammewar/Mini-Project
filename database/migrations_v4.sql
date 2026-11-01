@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS student_assessment_records (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS student_roadmap_milestones (
+    
     milestone_id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
     student_id INT UNSIGNED NOT NULL,
     career_id SMALLINT UNSIGNED NOT NULL,

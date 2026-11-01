@@ -1,22 +1,30 @@
 <?php
 /**
  * CareerAct — My Enrollments Module
+ * Tracks student registered, in-progress, and completed extracurricular activities and opportunities.
  */
 
 declare(strict_types=1);
+
+header('Cache-Control: no-cache, no-store, must-revalidate');
+header('Pragma: no-cache');
+header('Expires: 0');
 
 require_once __DIR__ . '/includes/auth_check.php';
 require_once __DIR__ . '/includes/helpers.php';
 require_once __DIR__ . '/config/db.php';
 
-$userId = (int)$_SESSION['user_id'];
+requireCompletedProfile('onboarding.php?msg=complete_profile');
+
+$userId = getCurrentUserId();
 $db = getDbConnection();
 
-// Get student_id
-$stmtStudent = $db->prepare("SELECT student_id FROM student_profiles WHERE user_id = :user_id LIMIT 1");
-$stmtStudent->execute([':user_id' => $userId]);
-$student = $stmtStudent->fetch();
-$studentId = $student ? (int)$student['student_id'] : 0;
+// Retrieve user info
+$stmtUser = $db->prepare("SELECT name, email FROM users WHERE id = :user_id LIMIT 1");
+$stmtUser->execute([':user_id' => $userId]);
+$student = $stmtUser->fetch();
+$fullName = $student['name'] ?? 'Student';
+$initials = strtoupper(substr($fullName, 0, 1));
 
 $successMsg = '';
 
@@ -25,41 +33,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['mark_completed_id']))
     if (verifyCsrfToken($_POST['csrf_token'] ?? '')) {
         $enrollmentId = (int)$_POST['mark_completed_id'];
         $stmtUpdate = $db->prepare("
-            UPDATE student_activity_enrollments 
-            SET completion_status = 'completed', 
-                enrollment_status_id = 5,
-                completion_verification = 'verified',
-                completed_at = NOW()
-            WHERE enrollment_id = :eid AND student_id = :sid
+            UPDATE enrollments 
+            SET status = 'completed', 
+                progress_pct = 100,
+                completed_at = CURDATE(),
+                updated_at = NOW()
+            WHERE id = :eid AND user_id = :user_id
         ");
-        $stmtUpdate->execute([':eid' => $enrollmentId, ':sid' => $studentId]);
-        $successMsg = 'Activity marked as completed & verified! Your dashboard stats have been updated.';
+        $stmtUpdate->execute([':eid' => $enrollmentId, ':user_id' => $userId]);
+        $successMsg = 'Activity marked as completed! Your dashboard milestone progress has been updated.';
     }
 }
 
-// Fetch Student Enrollments
+// Fetch Student Enrollments from modern table
 $stmt = $db->prepare("
     SELECT 
-        sae.enrollment_id,
-        sae.completion_status,
-        sae.completion_verification,
-        sae.enrolled_at,
-        sae.completed_at,
+        e.id AS enrollment_id,
+        e.status,
+        e.progress_pct,
+        e.created_at AS enrolled_at,
+        e.completed_at,
         a.title,
         a.description,
-        t.type_name,
-        m.mode_name,
-        COALESCE(o.organizer_name, 'Campus Organizer') AS organizer_name
-    FROM student_activity_enrollments sae
-    JOIN activities a ON sae.activity_id = a.activity_id
-    JOIN activity_types t ON a.activity_type_id = t.activity_type_id
-    JOIN activity_modes m ON a.mode_id = m.mode_id
-    LEFT JOIN organizers o ON a.organizer_id = o.organizer_id
-    WHERE sae.student_id = :student_id
-    ORDER BY sae.completion_status ASC, sae.enrolled_at DESC
+        a.delivery_mode,
+        ac.name AS category_name,
+        COALESCE(o.title, a.title) AS opportunity_title,
+        COALESCE(p.name, 'Verified Academic Partner') AS organizer_name
+    FROM enrollments e
+    JOIN activities a ON e.activity_id = a.id
+    LEFT JOIN activity_categories ac ON a.category_id = ac.id
+    LEFT JOIN opportunities o ON e.opportunity_id = o.id
+    LEFT JOIN providers p ON o.provider_id = p.id
+    WHERE e.user_id = :user_id AND e.status IN ('registered', 'in_progress', 'completed')
+    ORDER BY (e.status = 'completed') ASC, e.created_at DESC
 ");
-$stmt->execute([':student_id' => $studentId]);
-$enrollments = $stmt->fetchAll();
+$stmt->execute([':user_id' => $userId]);
+$enrollments = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 $csrfToken = getCsrfToken();
 ?>
@@ -69,7 +78,13 @@ $csrfToken = getCsrfToken();
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>My Enrollments — CareerAct</title>
-    <link rel="stylesheet" href="assets/css/dashboard.css">
+    <link rel="stylesheet" href="assets/css/dashboard.css?v=<?= time() ?>">
+    <style>
+        svg, svg path, svg circle, svg polygon, svg rect, svg line, svg polyline { fill: none !important; box-sizing: border-box; }
+        svg { display: inline-block !important; vertical-align: middle !important; stroke: currentColor !important; stroke-width: 2 !important; }
+        .sidebar-brand-icon svg { width: 20px !important; height: 20px !important; }
+        .sidebar-nav svg, .logout-link svg { width: 18px !important; height: 18px !important; }
+    </style>
 </head>
 <body class="dashboard-body">
 
@@ -88,12 +103,18 @@ $csrfToken = getCsrfToken();
             <nav>
                 <ul class="sidebar-nav">
                     <li><a href="dashboard.php" class="nav-link"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect></svg><span>Dashboard</span></a></li>
-                    <li><a href="activities.php" class="nav-link"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg><span>Explore Activities</span></a></li>
-                    <li><a href="career_goals.php" class="nav-link"><svg viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg><span>Career Goals</span></a></li>
-                    <li><a href="skills_assessment.php" class="nav-link"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg><span>Skills Assessment</span></a></li>
-                    <li><a href="enrollments.php" class="nav-link active" aria-current="page"><svg viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect><path d="M9 14l2 2 4-4"></path></svg><span>My Enrollments</span></a></li>
-                    <li><a href="resume.php" class="nav-link"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg><span>My Resume</span></a></li>
                     <li><a href="profile.php" class="nav-link"><svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg><span>My Profile</span></a></li>
+                    <li><a href="career_goals.php" class="nav-link"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg><span>Career Exploration</span></a></li>
+                    <li><a href="my_skills.php" class="nav-link"><svg viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg><span>My Skills</span></a></li>
+                    <li><a href="skills_assessment.php" class="nav-link"><svg viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg><span>Skill Assessment</span></a></li>
+                    <li><a href="skill_gap.php" class="nav-link"><svg viewBox="0 0 24 24"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"></path><path d="M22 12A10 10 0 0 0 12 2v10z"></path></svg><span>Skill-Gap Analysis</span></a></li>
+                    <li><a href="recommendations.php" class="nav-link"><svg viewBox="0 0 24 24"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg><span>Recommendations</span></a></li>
+                    <li><a href="activities.php" class="nav-link"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 6v6l4 2"></path></svg><span>Explore Activities</span></a></li>
+                    <li><a href="saved_activities.php" class="nav-link"><svg viewBox="0 0 24 24"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg><span>Saved Activities</span></a></li>
+                    <li><a href="enrollments.php" class="nav-link active" aria-current="page"><svg viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect><path d="M9 14l2 2 4-4"></path></svg><span>My Enrollments</span></a></li>
+                    <li><a href="portfolio.php" class="nav-link"><svg viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg><span>My Portfolio</span></a></li>
+                    <li><a href="resume.php" class="nav-link"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg><span>Resume Builder</span></a></li>
+                    <li><a href="settings.php" class="nav-link"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg><span>Settings</span></a></li>
                 </ul>
             </nav>
         </div>
@@ -123,29 +144,29 @@ $csrfToken = getCsrfToken();
             <div>
                 <?php if (!empty($enrollments)): ?>
                     <?php foreach ($enrollments as $item): ?>
-                        <?php $isComp = ($item['completion_status'] === 'completed'); ?>
-                        <article class="activity-card">
-                            <div class="activity-icon-box <?= $isComp ? 'green' : 'blue' ?>" style="<?= $isComp ? 'background: #ECFDF5; color: #0F9D8A;' : '' ?>">
+                        <?php $isComp = ($item['status'] === 'completed'); ?>
+                        <article class="activity-card" style="margin-bottom: 16px; background: #FFF; border: 1px solid #E4EAF2; border-radius: 12px; padding: 20px; display: flex; align-items: center; justify-content: space-between; gap: 16px;">
+                            <div class="activity-icon-box <?= $isComp ? 'green' : 'blue' ?>" style="width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; <?= $isComp ? 'background: #ECFDF5; color: #0F9D8A;' : 'background: #EEF3FF; color: #1769E8;' ?>">
                                 <?php if ($isComp): ?>
-                                    <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                                    <svg width="22" height="22" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
                                 <?php else: ?>
-                                    <svg viewBox="0 0 24 24"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+                                    <svg width="22" height="22" viewBox="0 0 24 24"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
                                 <?php endif; ?>
                             </div>
 
-                            <div class="activity-card-body">
-                                <div class="activity-badges-row">
-                                    <span class="activity-pill type"><?= e($item['type_name']) ?></span>
+                            <div class="activity-card-body" style="flex: 1;">
+                                <div class="activity-badges-row" style="display: flex; gap: 8px; margin-bottom: 6px;">
+                                    <span class="activity-pill type" style="background: #F1F5F9; color: #475569; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;"><?= e($item['category_name'] ?? 'Activity') ?></span>
                                     <?php if ($isComp): ?>
-                                        <span class="activity-pill match">✓ Completed & Verified</span>
+                                        <span class="activity-pill match" style="background: #EDFDF5; color: #059669; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;">✓ Completed</span>
                                     <?php else: ?>
-                                        <span class="activity-pill deadline" style="background: #EEF3FF; color: #1769E8;">⏳ In Progress</span>
+                                        <span class="activity-pill deadline" style="background: #EEF3FF; color: #1769E8; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;">⏳ Registered / In Progress</span>
                                     <?php endif; ?>
                                 </div>
 
-                                <h2 class="activity-title" style="font-size: 17px;"><?= e($item['title']) ?></h2>
-                                <p style="font-size: 12.5px; color: var(--secondary-text); margin: 2px 0 8px;">
-                                    Organized by <strong><?= e($item['organizer_name']) ?></strong> • <?= e($item['mode_name']) ?>
+                                <h2 class="activity-title" style="font-size: 16px; font-weight: 700; color: #163A70; margin: 0 0 4px;"><?= e($item['opportunity_title']) ?></h2>
+                                <p style="font-size: 12.5px; color: #64748B; margin: 0 0 6px;">
+                                    Organized by <strong><?= e($item['organizer_name']) ?></strong> • <?= ucfirst(e($item['delivery_mode'])) ?>
                                 </p>
                                 <span style="font-size: 11.5px; color: #94A3B8;">
                                     Enrolled: <?= date('M j, Y', strtotime($item['enrolled_at'])) ?>
@@ -157,26 +178,27 @@ $csrfToken = getCsrfToken();
 
                             <div class="activity-card-action">
                                 <?php if (!$isComp): ?>
-                                    <form method="POST" action="enrollments.php">
+                                    <form method="POST" action="enrollments.php" style="margin: 0;">
                                         <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
                                         <input type="hidden" name="mark_completed_id" value="<?= (int)$item['enrollment_id'] ?>">
-                                        <button type="submit" class="btn-view-details" style="background: #0F9D8A; color: #FFF; border-color: #0F9D8A;">
+                                        <button type="submit" class="btn-view-details" style="background: #0F9D8A; color: #FFF; border: none; padding: 8px 16px; border-radius: 8px; font-size: 12.5px; font-weight: 700; cursor: pointer;">
                                             Mark Completed
                                         </button>
                                     </form>
                                 <?php else: ?>
-                                    <span style="font-size: 12px; font-weight: 700; color: #0F9D8A;">
-                                        Verified on Transcript
+                                    <span style="font-size: 12px; font-weight: 700; color: #0F9D8A; display: inline-flex; align-items: center; gap: 4px;">
+                                        <svg width="14" height="14" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                                        <span>Verified Milestone</span>
                                     </span>
                                 <?php endif; ?>
                             </div>
                         </article>
                     <?php endforeach; ?>
                 <?php else: ?>
-                    <div class="empty-panel">
-                        <p style="font-weight: 600; font-size: 15px;">You have no enrolled activities yet.</p>
-                        <p style="font-size: 13px; margin: 6px 0 16px;">Enroll in hackathons, workshops, or contests to start tracking your progress.</p>
-                        <a href="activities.php" class="btn-view-pathway" style="display: inline-flex;">Explore Opportunities</a>
+                    <div class="empty-discovery-state" style="background: #FFF; border: 1px dashed #CBD5E1; border-radius: 12px; padding: 40px; text-align: center;">
+                        <p style="font-weight: 700; font-size: 16px; color: #163A70; margin: 0 0 6px;">You have no enrolled activities yet.</p>
+                        <p style="font-size: 13px; color: #64748B; margin: 0 0 16px;">Enroll in hackathons, workshops, or projects in Explore Activities to track your progress.</p>
+                        <a href="activities.php" class="btn-filter-events" style="display: inline-flex; text-decoration: none; padding: 9px 18px; border-radius: 8px;">Explore Activities & Events</a>
                     </div>
                 <?php endif; ?>
             </div>
