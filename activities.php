@@ -1,23 +1,31 @@
 <?php
 /**
- * CareerAct — Module: Personalized Extracurricular Activities & Event Discovery
+ * CareerAct — Module 9: Explore Activities & Events Across India
  * 
- * Recommends extracurricular activities targeted to the student's career goal,
- * allows preferred city selection (Pune, Mumbai, Bengaluru, Delhi, Hyderabad, Online),
- * and discovers verified real-world events and opportunities with automatic expiration.
+ * Screen 1: Category Tiles Only (Hackathons, Competitions, Internships, Workshops,
+ *           Projects, Leadership, Volunteering, Research, Conferences, Quizzes,
+ *           Mentorships, Entrepreneurship, Festivals, Sports).
+ * Screen 2: Dedicated Category Opportunity Listing across Indian States, Cities & All India,
+ *           with Gemini AI Discovery Intelligence, scope filters, verified source URLs,
+ *           and non-contaminating Save/Enroll actions.
+ * 
+ * Database: carrearact2
  */
 
 declare(strict_types=1);
 
 // Prevent browser from caching stale CSS or layout states
-header('Cache-Control: no-cache, no-store, must-revalidate');
-header('Pragma: no-cache');
-header('Expires: 0');
+if (!headers_sent()) {
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+}
 
 require_once __DIR__ . '/includes/auth_check.php';
 require_once __DIR__ . '/includes/helpers.php';
 require_once __DIR__ . '/config/db.php';
 require_once __DIR__ . '/includes/event_discovery_service.php';
+require_once __DIR__ . '/includes/activity_discovery_service.php';
 
 // Enforce authentication & profile completion
 requireCompletedProfile('onboarding.php?msg=complete_profile');
@@ -48,29 +56,25 @@ $nameParts = explode(' ', $fullName);
 $firstName = $nameParts[0];
 $initials  = strtoupper(substr($nameParts[0], 0, 1) . (isset($nameParts[1]) ? substr($nameParts[1], 0, 1) : ''));
 
-// Dynamic greeting
-$hour = (int)date('G');
-$greeting = $hour < 12 ? 'Good Morning' : ($hour < 17 ? 'Good Afternoon' : 'Good Evening');
-
-// 2. Handle POST Actions (City update, Save Opportunity, Enroll Activity)
+// 2. Handle POST Actions (Save Opportunity / Enroll Activity / Update Preferred City)
 $successMsg = '';
 $errorMsg   = '';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     $submittedToken = $_POST['csrf_token'] ?? '';
     if (verifyCsrfToken($submittedToken)) {
         
-        // Action A: Update Preferred City
+        // Action A: Update Preferred Location
         if (isset($_POST['set_preferred_city'])) {
             $newCity = trim((string)$_POST['set_preferred_city']);
             if ($newCity !== '') {
                 setStudentPreferredCity($db, $userId, $newCity);
                 $student['city'] = $newCity;
-                $successMsg = "Preferred city updated to {$newCity}. Showing opportunities in your area.";
+                $successMsg = "Preferred location updated to {$newCity}. Showing opportunities in your area.";
             }
         }
 
-        // Action B: Save / Enroll in an Opportunity
+        // Action B: Save / Enroll in an Opportunity (Strictly Future Opportunity - Does NOT Mark Completed)
         if (isset($_POST['enroll_opp_id'])) {
             $oppId = (int)$_POST['enroll_opp_id'];
             $actId = (int)($_POST['activity_id'] ?? 0);
@@ -80,71 +84,112 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $res = saveOrEnrollOpportunity($db, $userId, $actId, $oppId, $actionType);
                 if ($res['success']) {
                     $successMsg = ($actionType === 'saved') 
-                        ? 'Opportunity saved to your portal! You can access it anytime under "Saved Activities".' 
+                        ? 'Opportunity saved to your portal under "Saved Activities". It will not alter your past experience until verified completion.' 
                         : 'Successfully registered for this opportunity! Track your progress in "My Enrollments".';
                 }
             }
         }
 
-        // Action C: Direct Activity Enrollment
-        if (isset($_POST['enroll_activity_id'])) {
-            $actId = (int)$_POST['enroll_activity_id'];
-            $res = saveOrEnrollOpportunity($db, $userId, $actId, null, 'registered');
-            if ($res['success']) {
-                $successMsg = 'Activity added to your active enrollments tracker!';
-            }
+        // Action C: Live AI Activity Discovery
+        if (isset($_POST['run_ai_discovery'])) {
+            $discoveryService = new ActivityDiscoveryService($db);
+            $discResult = $discoveryService->discoverActivitiesLive($userId, ['location' => $studentPreferredCity]);
+            $successMsg = "✦ AI Activity Discovery Complete! Synchronized {$discResult['ingested_count']} verified opportunities across India aligned with your career goal ({$discResult['career_title']}).";
+            $aiDiscoveryProgress = $discResult['progress_steps'];
         }
     } else {
         $errorMsg = 'Security validation failed (invalid CSRF token). Please try again.';
     }
 }
 
-// 3. Retrieve Student's Target Career Goal & Recommended Activities
-$activeGoal = getStudentTargetCareer($db, $userId);
-$careerId   = $activeGoal ? (int)$activeGoal['career_id'] : 4; // Default to Software Developer (ID 4) if none set
-$recommendedActivities = getRecommendedActivities($db, $careerId, $userId);
+// 3. Indian States, Union Territories & City Taxonomy
+$indianStatesData = getIndianStatesAndCities();
+$studentPreferredCity = getStudentPreferredCity($db, $userId);
 
-// 4. Retrieve Supported Cities & Student's Current Preferred City
-$supportedCities = getSupportedCities($db);
-$currentCity = isset($_GET['city']) ? trim((string)$_GET['city']) : getStudentPreferredCity($db, $userId);
-
-// 5. Filter & Search Handling
-$searchQuery   = trim((string)($_GET['q'] ?? ''));
-$filterActivity = isset($_GET['activity_id']) ? (int)$_GET['activity_id'] : 0;
-$filterMode    = trim((string)($_GET['mode'] ?? 'all'));
-$filterCat     = isset($_GET['cat_id']) ? (int)$_GET['cat_id'] : 0;
-$filterCost    = trim((string)($_GET['cost'] ?? 'all'));
-
-$filters = [
-    'city'          => $currentCity,
-    'activity_id'   => $filterActivity,
-    'delivery_mode' => $filterMode,
-    'category_id'   => $filterCat,
-    'cost_type'     => $filterCost !== 'all' ? $filterCost : null,
-    'search'        => $searchQuery,
-];
-
-$opportunitiesList = getEventOpportunities($db, $filters, $userId);
-$totalOpenOpportunities = count($opportunitiesList);
-
-// Find active selected activity title if filtered
-$selectedActivityTitle = '';
-if ($filterActivity > 0) {
-    foreach ($recommendedActivities as $ra) {
-        if ((int)$ra['activity_id'] === $filterActivity) {
-            $selectedActivityTitle = $ra['title'];
+// Resolve Current State:
+$selectedState = trim((string)($_GET['state'] ?? ''));
+if ($selectedState === '') {
+    foreach ($indianStatesData as $stName => $stInfo) {
+        if (in_array(strtolower($studentPreferredCity), array_map('strtolower', $stInfo['cities']), true)) {
+            $selectedState = $stName;
             break;
         }
     }
-    if ($selectedActivityTitle === '') {
-        $stmtActName = $db->prepare("SELECT title FROM activities WHERE id = :id LIMIT 1");
-        $stmtActName->execute([':id' => $filterActivity]);
-        $selectedActivityTitle = (string)$stmtActName->fetchColumn();
+    if ($selectedState === '') {
+        $selectedState = 'All India';
     }
 }
 
-// Categories list for filter dropdown
-$categoriesList = $db->query("SELECT id, name FROM activity_categories ORDER BY id ASC")->fetchAll(PDO::FETCH_ASSOC);
+// Resolve Current City:
+$selectedCity = trim((string)($_GET['city'] ?? ''));
+if ($selectedCity === '' && $selectedState !== 'All India') {
+    $selectedCity = $studentPreferredCity;
+}
+
+$isAllIndia = ($selectedState === 'All India' || strtolower($selectedState) === 'all' || strtolower($selectedCity) === 'all india');
+
+// 4. Retrieve Student's Target Career Goal
+$activeGoal = getStudentTargetCareer($db, $userId);
+$careerId   = $activeGoal ? (int)$activeGoal['career_id'] : 4;
+
+// 5. Determine Screen Mode: Screen 1 (Category Tiles Only) vs. Screen 2 (Category Opportunity Listing)
+$categoryParam = trim((string)($_GET['category'] ?? ($_GET['cat_id'] ?? '')));
+$isCategoryView = ($categoryParam !== '');
+
+$selectedCategory = null;
+$opportunitiesList = [];
+$totalOpenOpportunities = 0;
+$aiDiscoveryInsights = null;
+
+if ($isCategoryView) {
+    // =========================================================================
+    // SCREEN 2: Category Opportunity Listing
+    // =========================================================================
+    $selectedCategory = getActivityCategoryDetails($db, $categoryParam);
+    if (!$selectedCategory) {
+        header('Location: activities.php');
+        exit;
+    }
+
+    $oppSearchQuery = trim((string)($_GET['q'] ?? ''));
+    $filterScope    = trim((string)($_GET['scope'] ?? 'all'));
+    $filterMode     = trim((string)($_GET['mode'] ?? 'all'));
+    $filterDeadline = trim((string)($_GET['deadline'] ?? 'all'));
+    $filterElig     = trim((string)($_GET['elig'] ?? 'all'));
+    $filterCost     = trim((string)($_GET['cost'] ?? 'all'));
+    $filterSort     = trim((string)($_GET['sort'] ?? 'deadline'));
+
+    $filters = [
+        'category_id'     => (int)$selectedCategory['id'],
+        'state'           => $isAllIndia ? 'all' : $selectedState,
+        'city'            => ($isAllIndia || $selectedCity === 'all') ? 'all' : $selectedCity,
+        'scope_level'     => $filterScope,
+        'delivery_mode'   => $filterMode,
+        'deadline_filter' => $filterDeadline,
+        'eligibility'     => $filterElig !== 'all' ? $filterElig : '',
+        'cost_type'       => $filterCost !== 'all' ? $filterCost : null,
+        'search'          => $oppSearchQuery,
+        'sort_by'         => $filterSort,
+    ];
+
+    $opportunitiesList = getEventOpportunities($db, $filters, $userId);
+    $totalOpenOpportunities = count($opportunitiesList);
+
+    // Retrieve Gemini AI Discovery Intelligence & Knowledge Base
+    $aiDiscoveryInsights = getCategoryAiDiscoveryInsights(
+        $db,
+        (string)$selectedCategory['code'],
+        $isAllIndia ? 'all' : $selectedState,
+        ($isAllIndia || $selectedCity === 'all') ? 'all' : $selectedCity,
+        $activeGoal['career_title'] ?? ''
+    );
+} else {
+    // =========================================================================
+    // SCREEN 1: Category Tiles / Cards Grid Only
+    // =========================================================================
+    $categorySearchQuery = trim((string)($_GET['cat_q'] ?? ($_GET['q'] ?? '')));
+    $categoriesCatalog = getActivityCategoriesCatalog($db, $userId, $categorySearchQuery);
+}
 
 $csrfToken = getCsrfToken();
 ?>
@@ -153,583 +198,400 @@ $csrfToken = getCsrfToken();
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Explore Extracurricular Activities & Real-World Events — CareerAct</title>
-    <meta name="description" content="Discover extracurricular activities and verified real-world opportunities tailored to your career goal.">
+    <title><?= $isCategoryView ? e($selectedCategory['name']) . ' Opportunities Across India' : 'Explore Activities Across India' ?> — CareerAct</title>
+    <meta name="description" content="Discover verified extracurricular activities, hackathons, competitions, workshops, and student opportunities across India.">
     <link rel="stylesheet" href="assets/css/dashboard.css?v=<?= time() ?>">
     <style>
-        /* Critical SVG & Dimension Guard to Guarantee Clean Rendering */
-        svg, svg path, svg circle, svg polygon, svg rect, svg line, svg polyline {
-            fill: none !important;
-            box-sizing: border-box;
-        }
-        svg {
-            display: inline-block !important;
-            vertical-align: middle !important;
-            stroke: currentColor !important;
-            stroke-width: 2 !important;
-            flex-shrink: 0 !important;
-        }
-        .sidebar-brand-icon svg { width: 20px !important; height: 20px !important; }
-        .sidebar-nav svg, .logout-link svg { width: 18px !important; height: 18px !important; }
-        .search-icon svg { width: 16px !important; height: 16px !important; }
-        .user-chevron svg { width: 14px !important; height: 14px !important; }
-
-        /* Discovery Top Banner */
-        .discovery-banner {
-            background: linear-gradient(135deg, #1769E8 0%, #163A70 100%);
-            border-radius: 16px;
-            padding: 28px 32px;
-            color: #FFFFFF;
+        /* Location Bar Container */
+        .location-selector-bar {
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-radius: 14px;
+            padding: 16px 22px;
             margin-bottom: 24px;
-            box-shadow: 0 10px 25px -5px rgba(23, 105, 232, 0.25);
+            box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04);
             display: flex;
-            flex-direction: column;
-            gap: 16px;
-        }
-        .banner-top-row {
-            display: flex;
+            align-items: center;
             justify-content: space-between;
-            align-items: flex-start;
             flex-wrap: wrap;
             gap: 16px;
         }
-        .banner-heading-wrap {
-            max-width: 700px;
+        .location-left-group {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
         }
-        .banner-track-chip {
+        .location-label-pill {
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            background: rgba(255, 255, 255, 0.18);
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 700;
-            margin-bottom: 10px;
-        }
-        .banner-title {
-            font-size: 24px;
-            font-weight: 800;
-            margin: 0 0 6px;
-            letter-spacing: -0.4px;
-        }
-        .banner-subtitle {
-            font-size: 13.5px;
-            color: rgba(255, 255, 255, 0.88);
-            margin: 0;
-            line-height: 1.5;
-        }
-        .banner-goal-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            background: #FFFFFF;
-            color: #1769E8;
             font-size: 13px;
             font-weight: 700;
-            padding: 10px 18px;
-            border-radius: 10px;
-            text-decoration: none;
-            transition: all 0.2s ease;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            color: #0F172A;
         }
-        .banner-goal-btn:hover {
-            background: #F8FAFD;
-            transform: translateY(-1px);
-        }
-
-        /* Preferred City Selector Strip */
-        .city-selector-strip {
-            background: rgba(255, 255, 255, 0.12);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 12px;
-            padding: 12px 16px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 12px;
-        }
-        .city-strip-label {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 12.5px;
-            font-weight: 700;
-            color: #FFFFFF;
-        }
-        .city-pills-wrap {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        .city-pill-btn {
-            background: rgba(255, 255, 255, 0.18);
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            color: #FFFFFF;
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 12px;
+        .loc-select {
+            height: 40px;
+            padding: 0 14px;
+            border-radius: 8px;
+            border: 1px solid #CBD5E1;
+            background: #F8FAFC;
+            font-size: 13px;
             font-weight: 600;
+            color: #1E293B;
+            outline: none;
+            transition: all 0.2s ease;
+        }
+        .loc-select:focus {
+            border-color: #1769E8;
+            background: #FFFFFF;
+            box-shadow: 0 0 0 3px rgba(23, 105, 232, 0.12);
+        }
+        .loc-input-city {
+            height: 40px;
+            padding: 0 14px;
+            border-radius: 8px;
+            border: 1px solid #CBD5E1;
+            background: #F8FAFC;
+            font-size: 13px;
+            color: #1E293B;
+            outline: none;
+            width: 170px;
+        }
+        .loc-input-city:focus {
+            border-color: #1769E8;
+            background: #FFFFFF;
+        }
+        .loc-apply-btn {
+            background: #1769E8;
+            color: #FFFFFF;
+            font-size: 13px;
+            font-weight: 700;
+            padding: 9px 16px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            transition: all 0.2s ease;
             text-decoration: none;
             display: inline-flex;
             align-items: center;
-            gap: 5px;
-            transition: all 0.2s ease;
+            gap: 6px;
         }
-        .city-pill-btn:hover {
-            background: rgba(255, 255, 255, 0.3);
-        }
-        .city-pill-btn.active {
-            background: #FFFFFF;
-            color: #163A70;
-            border-color: #FFFFFF;
-            font-weight: 700;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-        }
-        .city-pill-count {
-            background: rgba(0, 0, 0, 0.15);
-            font-size: 10.5px;
-            padding: 1px 6px;
-            border-radius: 10px;
-        }
-        .city-pill-btn.active .city-pill-count {
-            background: #EEF3FF;
-            color: #1769E8;
-            font-weight: 700;
+        .loc-apply-btn:hover {
+            background: #1255C0;
         }
 
-        /* Career-Targeted Recommended Activities Grid */
-        .section-header-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 16px;
-        }
-        .section-main-title {
-            font-size: 18px;
-            font-weight: 800;
-            color: #163A70;
-            margin: 0;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .activities-card-grid {
+        /* Screen 1: Category Tiles Grid */
+        .category-tiles-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-            gap: 18px;
-            margin-bottom: 32px;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 36px;
         }
-        .activity-rec-card {
+        .category-tile-card {
             background: #FFFFFF;
-            border: 1px solid #E4EAF2;
-            border-radius: 14px;
-            padding: 20px;
-            box-shadow: 0 2px 8px rgba(22, 58, 112, 0.04);
+            border: 1px solid #E2E8F0;
+            border-radius: 16px;
+            padding: 24px;
+            text-decoration: none;
+            color: inherit;
             display: flex;
             flex-direction: column;
             justify-content: space-between;
-            transition: all 0.2s ease;
+            min-height: 180px;
+            transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
             position: relative;
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+            cursor: pointer;
         }
-        .activity-rec-card:hover {
+        .category-tile-card:hover {
+            transform: translateY(-4px);
             border-color: #1769E8;
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px -4px rgba(23, 105, 232, 0.12);
+            box-shadow: 0 12px 24px -6px rgba(23, 105, 232, 0.16);
         }
-        .activity-rec-card.selected {
-            border: 2px solid #1769E8;
-            background: #FAFDFF;
-        }
-        .act-card-header {
+        .tile-icon-box {
+            width: 56px;
+            height: 56px;
+            border-radius: 14px;
             display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 10px;
-            gap: 8px;
-        }
-        .act-category-badge {
-            background: #EEF3FF;
-            color: #1769E8;
-            font-size: 11px;
-            font-weight: 700;
-            padding: 3px 8px;
-            border-radius: 6px;
-            text-transform: uppercase;
-            letter-spacing: 0.4px;
-        }
-        .act-gap-badge {
-            background: #EDFDF5;
-            color: #059669;
-            font-size: 10.5px;
-            font-weight: 700;
-            padding: 3px 8px;
-            border-radius: 6px;
-            display: inline-flex;
             align-items: center;
-            gap: 4px;
-        }
-        .act-card-title {
-            font-size: 15px;
-            font-weight: 700;
-            color: #163A70;
-            margin: 0 0 8px;
-            line-height: 1.4;
-        }
-        .act-why-benefit {
-            background: #F8FAFD;
-            border-left: 3px solid #1769E8;
-            padding: 8px 10px;
-            font-size: 12px;
-            color: #475569;
-            border-radius: 0 6px 6px 0;
-            margin-bottom: 12px;
-            line-height: 1.4;
-        }
-        .act-skills-list {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 5px;
+            justify-content: center;
             margin-bottom: 16px;
         }
-        .act-skill-chip {
-            background: #F1F5F9;
-            color: #334155;
-            font-size: 11px;
-            font-weight: 600;
-            padding: 2px 7px;
-            border-radius: 4px;
+        .tile-category-name {
+            font-size: 18px;
+            font-weight: 800;
+            color: #0F172A;
+            line-height: 1.3;
+            margin: 0 0 6px 0;
         }
-        .act-card-footer {
+        .tile-bottom-meta {
+            margin-top: 16px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding-top: 12px;
             border-top: 1px solid #F1F5F9;
+            padding-top: 12px;
         }
-        .btn-filter-events {
-            background: #1769E8;
-            color: #FFFFFF;
+        .tile-opps-count {
             font-size: 12px;
             font-weight: 700;
-            padding: 7px 14px;
-            border-radius: 8px;
-            text-decoration: none;
-            display: inline-flex;
+            color: #059669;
+            display: flex;
             align-items: center;
-            gap: 6px;
-            transition: all 0.2s ease;
+            gap: 5px;
         }
-        .btn-filter-events:hover {
-            background: #1356be;
-        }
-        .btn-filter-events.active {
-            background: #0F9D8A;
+        .tile-opps-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background-color: #10B981;
         }
 
-        /* Filter Toolbar */
-        .filter-toolbar {
-            background: #FFFFFF;
-            border: 1px solid #E4EAF2;
-            border-radius: 12px;
-            padding: 16px 20px;
+        /* Screen 2: Gemini AI Discovery Intelligence Box */
+        .ai-discovery-box {
+            background: linear-gradient(135deg, #F8FAFC 0%, #EEF4FF 100%);
+            border: 1px solid #BFDBFE;
+            border-radius: 14px;
+            padding: 22px 26px;
             margin-bottom: 24px;
+            box-shadow: 0 4px 14px rgba(23, 105, 232, 0.06);
+        }
+        .ai-status-row {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 14px;
-            box-shadow: 0 2px 6px rgba(22, 58, 112, 0.03);
-        }
-        .search-field-wrap {
-            flex: 1;
-            min-width: 240px;
-            position: relative;
-        }
-        .search-field-input {
-            width: 100%;
-            height: 40px;
-            padding: 8px 14px 8px 36px;
-            background: #F8FAFD;
-            border: 1px solid #E4EAF2;
-            border-radius: 8px;
-            font-size: 13.5px;
-            color: #17243B;
-            outline: none;
-            transition: border-color 0.2s;
-        }
-        .search-field-input:focus {
-            border-color: #1769E8;
-            background: #FFFFFF;
-        }
-        .filter-controls-group {
-            display: flex;
-            align-items: center;
+            margin-bottom: 12px;
             flex-wrap: wrap;
             gap: 10px;
         }
-        .filter-select {
-            height: 40px;
-            padding: 0 12px;
-            background: #F8FAFD;
-            border: 1px solid #E4EAF2;
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 600;
-            color: #334155;
-            outline: none;
-            cursor: pointer;
-        }
-        .filter-select:focus {
-            border-color: #1769E8;
-        }
-        .btn-clear-filters {
-            font-size: 12.5px;
+        .ai-status-pill {
+            font-size: 11.5px;
             font-weight: 700;
-            color: #DC2626;
-            text-decoration: none;
-            padding: 8px 12px;
-            border-radius: 8px;
-            background: #FEF2F2;
-            transition: all 0.2s;
+            padding: 4px 12px;
+            border-radius: 20px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: #DBEAFE;
+            color: #1D4ED8;
+            border: 1px solid #93C5FD;
         }
-        .btn-clear-filters:hover {
-            background: #FEE2E2;
+        .ai-summary-text {
+            font-size: 13.5px;
+            color: #334155;
+            line-height: 1.6;
+            margin-bottom: 14px;
+        }
+        .ai-insights-split {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin-bottom: 12px;
+        }
+        .ai-insight-block {
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-radius: 10px;
+            padding: 14px 18px;
+        }
+        .ai-block-title {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #64748B;
+            margin-bottom: 8px;
+        }
+        .ai-list-bullet {
+            margin: 0;
+            padding-left: 18px;
+            font-size: 12.5px;
+            color: #334155;
+            line-height: 1.5;
+        }
+        .ai-list-bullet li {
+            margin-bottom: 4px;
+        }
+        .ai-disclaimer-note {
+            font-size: 11.5px;
+            color: #64748B;
+            border-top: 1px dashed #CBD5E1;
+            padding-top: 10px;
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
 
-        /* Opportunities / Events Grid */
-        .opportunities-grid {
+        /* Screen 2: Opportunity Cards Grid */
+        .opps-cards-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-            gap: 20px;
-            margin-bottom: 40px;
+            gap: 22px;
+            margin-bottom: 36px;
         }
-        .event-card {
+        .opp-card {
             background: #FFFFFF;
-            border: 1px solid #E4EAF2;
+            border: 1px solid #E2E8F0;
             border-radius: 14px;
-            padding: 22px;
-            box-shadow: 0 2px 10px rgba(22, 58, 112, 0.04);
+            padding: 24px;
+            box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04);
             display: flex;
             flex-direction: column;
             justify-content: space-between;
             transition: all 0.2s ease;
-            position: relative;
         }
-        .event-card:hover {
+        .opp-card:hover {
+            transform: translateY(-3px);
             border-color: #CBD5E1;
-            transform: translateY(-2px);
-            box-shadow: 0 8px 24px -4px rgba(22, 58, 112, 0.1);
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
         }
-        .event-card-top {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 12px;
-            gap: 8px;
-        }
-        .event-format-pill {
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-size: 11px;
+        .opp-scope-pill {
+            font-size: 10.5px;
             font-weight: 700;
             text-transform: uppercase;
+            letter-spacing: 0.4px;
+            padding: 3px 9px;
+            border-radius: 12px;
+            display: inline-block;
         }
-        .event-format-pill.online { background: #EEF2FF; color: #4F46E5; }
-        .event-format-pill.offline { background: #EDFDF5; color: #059669; }
-        .event-format-pill.hybrid { background: #FFF7EB; color: #D97706; }
-
-        .deadline-countdown-badge {
-            font-size: 11px;
-            font-weight: 700;
-            padding: 3px 8px;
-            border-radius: 6px;
+        .scope-national {
+            background: #FEF3C7;
+            color: #92400E;
+            border: 1px solid #FDE68A;
         }
-        .deadline-countdown-badge.urgent {
-            background: #FEF2F2;
-            color: #DC2626;
-            border: 1px solid #FCA5A5;
+        .scope-state {
+            background: #EFF6FF;
+            color: #1E40AF;
+            border: 1px solid #BFDBFE;
         }
-        .deadline-countdown-badge.normal {
+        .scope-local {
             background: #F1F5F9;
             color: #475569;
+            border: 1px solid #E2E8F0;
         }
-
-        .event-title {
-            font-size: 16px;
+        .scope-intl {
+            background: #ECFDF5;
+            color: #065F46;
+            border: 1px solid #A7F3D0;
+        }
+        .opp-card-title {
+            font-size: 17px;
             font-weight: 800;
-            color: #163A70;
-            margin: 0 0 6px;
+            color: #0F172A;
+            margin: 8px 0 6px 0;
             line-height: 1.35;
         }
-        .event-organizer {
+        .opp-organizer-row {
             font-size: 12.5px;
             color: #64748B;
-            font-weight: 600;
             margin-bottom: 12px;
             display: flex;
             align-items: center;
             gap: 6px;
         }
-        .event-desc {
+        .opp-organizer-row strong {
+            color: #1E293B;
+        }
+        .opp-meta-table {
+            background: #F8FAFC;
+            border: 1px solid #F1F5F9;
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-bottom: 14px;
+            font-size: 12px;
+        }
+        .opp-meta-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+            color: #475569;
+        }
+        .opp-meta-row:last-child {
+            margin-bottom: 0;
+        }
+        .opp-desc-text {
             font-size: 13px;
             color: #475569;
             line-height: 1.5;
             margin-bottom: 14px;
         }
-        .event-meta-table {
-            background: #F8FAFD;
-            border-radius: 8px;
-            padding: 10px 14px;
+        .opp-elig-box {
+            background: #FFFBEB;
+            border: 1px solid #FEF3C7;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 11.5px;
+            color: #92400E;
             margin-bottom: 16px;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            font-size: 12px;
+            line-height: 1.4;
         }
-        .event-meta-row {
+        .opp-actions-row {
+            border-top: 1px solid #F1F5F9;
+            padding-top: 16px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            color: #475569;
-        }
-        .event-meta-row strong {
-            color: #163A70;
-        }
-        .event-card-actions {
-            display: flex;
-            align-items: center;
             gap: 10px;
-            margin-top: 8px;
+            flex-wrap: wrap;
         }
-        .btn-register-official {
-            flex: 1;
-            background: #1769E8;
-            color: #FFFFFF;
-            text-align: center;
-            padding: 10px 14px;
-            border-radius: 8px;
-            font-size: 13px;
+        .opp-official-link {
+            font-size: 12.5px;
             font-weight: 700;
+            color: #1769E8;
             text-decoration: none;
             display: inline-flex;
             align-items: center;
-            justify-content: center;
-            gap: 6px;
-            transition: all 0.2s ease;
+            gap: 4px;
         }
-        .btn-register-official:hover {
-            background: #1356be;
-            box-shadow: 0 4px 12px rgba(23, 105, 232, 0.25);
+        .opp-official-link:hover {
+            text-decoration: underline;
         }
-        .btn-save-opp {
-            background: #FFFFFF;
-            border: 1px solid #CBD5E1;
-            color: #475569;
-            padding: 9px 14px;
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            transition: all 0.2s ease;
-        }
-        .btn-save-opp:hover {
-            background: #F1F5F9;
-            border-color: #94A3B8;
-            color: #163A70;
-        }
-        .btn-save-opp.saved {
-            background: #EDFDF5;
-            border-color: #A7F3D0;
-            color: #059669;
+        .opp-btn-action {
+            padding: 7px 14px;
+            border-radius: 6px;
+            font-size: 12px;
             font-weight: 700;
+            border: none;
+            cursor: pointer;
+            transition: all 0.2s ease;
         }
-
-        /* Alert Banners */
-        .alert-banner {
-            padding: 12px 18px;
-            border-radius: 10px;
-            font-size: 13.5px;
-            font-weight: 600;
-            margin-bottom: 20px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
+        .opp-btn-save {
+            background: #F1F5F9;
+            color: #334155;
+            border: 1px solid #CBD5E1;
         }
-        .alert-banner.success {
-            background: #EDFDF5;
-            color: #059669;
+        .opp-btn-save:hover {
+            background: #E2E8F0;
+        }
+        .opp-btn-enroll {
+            background: #1769E8;
+            color: #FFFFFF;
+        }
+        .opp-btn-enroll:hover {
+            background: #1255C0;
+        }
+        .opp-badge-saved {
+            background: #ECFDF5;
+            color: #065F46;
             border: 1px solid #A7F3D0;
-        }
-        .alert-banner.error {
-            background: #FEF2F2;
-            color: #DC2626;
-            border: 1px solid #FCA5A5;
-        }
-
-        /* Empty State */
-        .empty-discovery-state {
-            background: #FFFFFF;
-            border: 1px dashed #CBD5E1;
-            border-radius: 14px;
-            padding: 48px 24px;
-            text-align: center;
-            max-width: 600px;
-            margin: 40px auto;
-        }
-        .empty-icon {
-            width: 48px;
-            height: 48px;
-            border-radius: 50%;
-            background: #EEF3FF;
-            color: #1769E8;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto 16px;
-        }
-        .empty-icon svg {
-            width: 24px !important;
-            height: 24px !important;
-        }
-        .empty-title {
-            font-size: 17px;
-            font-weight: 800;
-            color: #163A70;
-            margin: 0 0 6px;
-        }
-        .empty-desc {
-            font-size: 13.5px;
-            color: #64748B;
-            line-height: 1.5;
-            margin: 0 0 16px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 11.5px;
+            font-weight: 700;
         }
     </style>
 </head>
 <body class="dashboard-body">
 
-    <!-- Mobile Drawer Overlay -->
-    <div class="sidebar-overlay" id="sidebarOverlay"></div>
-
-    <!-- ====================================================================
-         1. SIDEBAR NAVIGATION (14 ITEMS)
-         ==================================================================== -->
+    <!-- Sidebar Navigation -->
     <aside class="dashboard-sidebar" id="dashboardSidebar" aria-label="Portal Navigation">
         <div>
-            <!-- Branding Header -->
             <div class="sidebar-header">
                 <a href="dashboard.php" class="sidebar-brand-wrapper">
                     <div class="sidebar-brand-icon" aria-hidden="true">
-                        <svg width="20" height="20" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
+                        <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
                     </div>
                     <div class="sidebar-brand-text">
                         <span class="sidebar-brand-name">CareerAct</span>
@@ -738,425 +600,577 @@ $csrfToken = getCsrfToken();
                 </a>
             </div>
 
-            <!-- Navigation Links -->
             <nav>
                 <ul class="sidebar-nav">
-                    <li><a href="dashboard.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect></svg><span>Dashboard</span></a></li>
-                    <li><a href="profile.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg><span>My Profile</span></a></li>
-                    <li><a href="career_goals.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg><span>Career Exploration</span></a></li>
-                    <li><a href="my_skills.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg><span>My Skills</span></a></li>
-                    <li><a href="skills_assessment.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg><span>Skill Assessment</span></a></li>
-                    <li><a href="skill_gap.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"></path><path d="M22 12A10 10 0 0 0 12 2v10z"></path></svg><span>Skill-Gap Analysis</span></a></li>
-                    <li><a href="recommendations.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg><span>Recommendations</span></a></li>
-                    <li><a href="activities.php" class="nav-link active" aria-current="page"><svg width="18" height="18" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 6v6l4 2"></path></svg><span>Explore Activities</span></a></li>
-                    <li><a href="saved_activities.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg><span>Saved Activities</span></a></li>
-                    <li><a href="enrollments.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect><path d="M9 14l2 2 4-4"></path></svg><span>My Enrollments</span></a></li>
-                    <li><a href="portfolio.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg><span>My Portfolio</span></a></li>
-                    <li><a href="resume.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg><span>Resume Builder</span></a></li>
-                    <li><a href="settings.php" class="nav-link"><svg width="18" height="18" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg><span>Settings</span></a></li>
+                    <li>
+                        <a href="dashboard.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect></svg>
+                            <span>Dashboard</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="profile.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+                            <span>My Profile</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="career_goals.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg>
+                            <span>Career Exploration</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="my_skills.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
+                            <span>My Skills</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="skills_assessment.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
+                            <span>Skill Assessment</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="skill_gap.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"></path><path d="M22 12A10 10 0 0 0 12 2v10z"></path></svg>
+                            <span>Skill-Gap Analysis</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="activities.php" class="nav-link active" aria-current="page">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="M12 6v6l4 2"></path></svg>
+                            <span>Explore Activities</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="roadmap.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+                            <span>Career Roadmap</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="saved_activities.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+                            <span>Saved Activities</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="enrollments.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect><path d="M9 14l2 2 4-4"></path></svg>
+                            <span>My Enrollments</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="portfolio.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>
+                            <span>My Portfolio</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="resume.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+                            <span>Resume Builder</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="notifications.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
+                            <span>Notifications</span><?php if (!empty($unreadNotificationsCount) && $unreadNotificationsCount > 0): ?><span class="badge-pill danger" style="font-size:10px; padding:2px 6px; margin-left:auto; background:#EF4444; color:#fff; border-radius:10px;"><?= $unreadNotificationsCount ?></span><?php endif; ?>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="settings.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                            <span>Settings</span>
+                        </a>
+                    </li>
                 </ul>
             </nav>
         </div>
 
         <div class="sidebar-footer">
             <a href="logout.php" class="logout-link" id="sidebarLogout">
-                <svg width="18" height="18" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+                <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
                 <span>Logout</span>
             </a>
         </div>
     </aside>
 
-    <!-- ====================================================================
-         2. MAIN VIEWPORT
-         ==================================================================== -->
+    <!-- Main Content Area -->
     <div class="dashboard-main">
-
-        <!-- Top Navigation Bar -->
         <header class="dashboard-topbar">
-            <button type="button" class="mobile-toggle-btn" id="mobileMenuBtn" style="display: none;" aria-label="Toggle navigation menu">
-                <svg width="22" height="22" viewBox="0 0 24 24"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
-            </button>
-
             <div class="topbar-welcome">
-                <span class="welcome-title"><?= e($greeting) ?>, <?= e($firstName) ?>!</span>
-                <span class="welcome-subtitle">Explore activities that build verified skills for your career pathway.</span>
+                <span class="welcome-title">Explore Activities Across India</span>
+                <span class="welcome-subtitle">Module 9: National & State-Level Opportunity Discovery</span>
             </div>
-
             <div class="topbar-actions">
-                <div class="user-profile-chip" style="cursor: default;">
+                <a href="skills_assessment.php?action=result#recommendations" class="btn-view-details" style="padding: 7px 14px;">View AI Recommendations &rarr;</a>
+                <a href="profile.php" class="user-profile-chip">
                     <div class="avatar-circle"><?= e($initials) ?></div>
-                    <div class="user-text-info">
-                        <span class="user-name"><?= e($fullName) ?></span>
-                        <span class="user-level"><?= e(ucfirst($student['experience_level'] ?? 'Student')) ?></span>
-                    </div>
-                </div>
+                    <div class="user-text-info"><span class="user-name"><?= e($fullName) ?></span><span class="user-level">Student</span></div>
+                </a>
             </div>
         </header>
 
-        <!-- Main Content Shell -->
         <main class="dashboard-content">
 
-            <!-- Flash Notifications -->
-            <?php if ($successMsg): ?>
-                <div class="alert-banner success" role="alert">
-                    <svg width="18" height="18" viewBox="0 0 24 24" style="stroke:#059669;"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                    <span><?= e($successMsg) ?></span>
+            <?php if (!empty($successMsg)): ?>
+                <div style="background:#ECFDF5; border:1px solid #A7F3D0; color:#065F46; padding:12px 18px; border-radius:8px; margin-bottom:20px; font-size:13.5px;">
+                    <?= e($successMsg) ?>
+                </div>
+            <?php endif; ?>
+            <?php if (!empty($errorMsg)): ?>
+                <div style="background:#FEF2F2; border:1px solid #FECACA; color:#991B1B; padding:12px 18px; border-radius:8px; margin-bottom:20px; font-size:13.5px;">
+                    <?= e($errorMsg) ?>
                 </div>
             <?php endif; ?>
 
-            <?php if ($errorMsg): ?>
-                <div class="alert-banner error" role="alert">
-                    <svg width="18" height="18" viewBox="0 0 24 24" style="stroke:#DC2626;"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
-                    <span><?= e($errorMsg) ?></span>
-                </div>
-            <?php endif; ?>
+            <!-- Location Selector Bar (All India, States, Cities & Custom) -->
+            <form method="GET" action="activities.php" class="location-selector-bar">
+                <?php if ($isCategoryView): ?>
+                    <input type="hidden" name="category" value="<?= e($selectedCategory['code']) ?>">
+                <?php endif; ?>
 
-            <!-- ================================================================
-                 A. TOP BANNER: TARGET CAREER & PREFERRED CITY SELECTOR
-                 ================================================================ -->
-            <section class="discovery-banner" aria-label="Target Career and City Selector">
-                <div class="banner-top-row">
-                    <div class="banner-heading-wrap">
-                        <div class="banner-track-chip">
-                            <svg width="14" height="14" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg>
-                            <span>Target Career Goal</span>
-                        </div>
-                        <h1 class="banner-title"><?= e($activeGoal['career_title'] ?? 'Software Developer') ?></h1>
-                        <p class="banner-subtitle">
-                            Curated extracurricular activities designed to develop the professional skills, portfolio evidence, and competencies required for this role.
-                        </p>
-                    </div>
+                <div class="location-left-group">
+                    <span class="location-label-pill">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1769E8" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>
+                        Location in India:
+                    </span>
 
-                    <a href="career_goals.php" class="banner-goal-btn" title="Change target career goal">
-                        <svg width="16" height="16" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
-                        <span>Change Career Goal</span>
-                    </a>
-                </div>
+                    <select name="state" id="stateSelect" class="loc-select" onchange="updateCityDropdown(this.value)">
+                        <option value="All India" <?= ($selectedState === 'All India') ? 'selected' : '' ?>>🇮🇳 All India (National & Online)</option>
+                        <option value="online" <?= ($selectedState === 'online') ? 'selected' : '' ?>>🌐 Online / Virtual Only</option>
+                        <optgroup label="Indian States & UTs">
+                            <?php foreach (array_keys($indianStatesData) as $st): ?>
+                                <option value="<?= e($st) ?>" <?= ($selectedState === $st) ? 'selected' : '' ?>><?= e($st) ?></option>
+                            <?php endforeach; ?>
+                        </optgroup>
+                    </select>
 
-                <!-- Preferred City Selector Strip -->
-                <div class="city-selector-strip">
-                    <div class="city-strip-label">
-                        <svg width="16" height="16" viewBox="0 0 24 24"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>
-                        <span>Preferred City Hub:</span>
-                    </div>
-
-                    <div class="city-pills-wrap">
-                        <?php foreach ($supportedCities as $sc): ?>
-                            <?php 
-                                $isCityActive = (
-                                    ($sc['code'] === 'all' && (strtolower($currentCity) === 'all' || empty($currentCity))) ||
-                                    ($sc['code'] === 'online' && strtolower($currentCity) === 'online') ||
-                                    (stripos($currentCity, $sc['name']) !== false)
-                                );
-                                $cityUrl = 'activities.php?' . http_build_query(array_merge($_GET, ['city' => $sc['name']]));
-                            ?>
-                            <a href="<?= e($cityUrl) ?>" class="city-pill-btn <?= $isCityActive ? 'active' : '' ?>">
-                                <span><?= e($sc['display']) ?></span>
-                                <span class="city-pill-count"><?= $sc['count'] ?></span>
-                            </a>
+                    <select name="city" id="citySelect" class="loc-select">
+                        <option value="all">All Cities / Districts</option>
+                        <?php 
+                        $citiesForState = $indianStatesData[$selectedState]['cities'] ?? [];
+                        foreach ($citiesForState as $cName):
+                        ?>
+                            <option value="<?= e($cName) ?>" <?= (strcasecmp($selectedCity, $cName) === 0) ? 'selected' : '' ?>><?= e($cName) ?></option>
                         <?php endforeach; ?>
-                    </div>
+                    </select>
+
+                    <input type="text" name="custom_city" placeholder="Or type any Indian town" value="<?= (!in_array(strtolower($selectedCity), array_merge(['all', 'all india'], array_map('strtolower', $citiesForState)))) ? e($selectedCity) : '' ?>" class="loc-input-city" title="Enter any custom city, district, or college town in India">
                 </div>
-            </section>
 
-            <!-- ================================================================
-                 B. SECTION 1: CAREER-TARGETED RECOMMENDED ACTIVITIES
-                 ================================================================ -->
-            <section aria-label="Career-Targeted Activities">
-                <div class="section-header-row">
-                    <div>
-                        <h2 class="section-main-title">
-                            <svg width="20" height="20" viewBox="0 0 24 24" style="stroke:#1769E8;"><circle cx="12" cy="12" r="10"></circle><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
-                            <span>Recommended Activities for <?= e($activeGoal['career_title'] ?? 'Your Goal') ?></span>
-                        </h2>
-                        <span style="font-size: 13px; color: #64748B;">High-impact activities proven to cultivate target competencies</span>
-                    </div>
-
-                    <?php if ($filterActivity > 0): ?>
-                        <a href="activities.php?city=<?= urlencode($currentCity) ?>" style="font-size: 12.5px; font-weight: 700; color: #1769E8; text-decoration: none;">
-                            Show All Activities (<?= count($recommendedActivities) ?>) &rarr;
-                        </a>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <button type="submit" class="loc-apply-btn">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                        Discover Opportunities
+                    </button>
+                    <?php if (!$isAllIndia && !empty($selectedCity) && $selectedCity !== 'all'): ?>
+                        <button type="button" onclick="setDefaultCity('<?= e($selectedCity) ?>')" class="btn-view-details" style="font-size: 12px; padding: 7px 12px;" title="Save as default location in profile">
+                            Set as Profile City
+                        </button>
                     <?php endif; ?>
                 </div>
+            </form>
 
-                <div class="activities-card-grid">
-                    <?php foreach ($recommendedActivities as $act): ?>
-                        <?php $isSelected = ($filterActivity === (int)$act['activity_id']); ?>
-                        <div class="activity-rec-card <?= $isSelected ? 'selected' : '' ?>">
-                            <div>
-                                <div class="act-card-header">
-                                    <span class="act-category-badge"><?= e($act['category_name']) ?></span>
-                                    <?php if ($act['closes_gap']): ?>
-                                        <span class="act-gap-badge" title="Directly addresses your identified skill gap">
-                                            <svg width="12" height="12" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                            <span>Closes Gap</span>
-                                        </span>
-                                    <?php endif; ?>
-                                </div>
-
-                                <h3 class="act-card-title"><?= e($act['title']) ?></h3>
-
-                                <div class="act-why-benefit">
-                                    <strong>Why it helps:</strong> <?= e($act['why_beneficial']) ?>
-                                </div>
-
-                                <?php if (!empty($act['skills_developed'])): ?>
-                                    <div class="act-skills-list">
-                                        <?php foreach ($act['skills_developed'] as $sk): ?>
-                                            <span class="act-skill-chip"><?= e($sk['name']) ?></span>
-                                        <?php endforeach; ?>
-                                    </div>
-                                <?php endif; ?>
-                            </div>
-
-                            <div class="act-card-footer">
-                                <span style="font-size: 11.5px; color: #64748B; font-weight: 600;">
-                                    <?= $act['live_opportunities_count'] ?> Live Event<?= $act['live_opportunities_count'] === 1 ? '' : 's' ?>
-                                </span>
-
-                                <?php if ($isSelected): ?>
-                                    <a href="activities.php?city=<?= urlencode($currentCity) ?>" class="btn-filter-events active" title="Clear activity filter">
-                                        <svg width="14" height="14" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                        <span>Showing Events</span>
-                                    </a>
-                                <?php else: ?>
-                                    <a href="activities.php?activity_id=<?= $act['activity_id'] ?>&city=<?= urlencode($currentCity) ?>" class="btn-filter-events">
-                                        <span>Explore Events</span>
-                                        <svg width="14" height="14" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
-                                    </a>
-                                <?php endif; ?>
-                            </div>
-                        </div>
-                    <?php endforeach; ?>
-                </div>
-            </section>
-
-            <!-- ================================================================
-                 C. SECTION 2: LIVE REAL-WORLD EVENTS & OPPORTUNITIES
-                 ================================================================ -->
-            <section aria-label="Available Real-World Events">
-                <div class="section-header-row">
-                    <div>
-                        <h2 class="section-main-title">
-                            <svg width="20" height="20" viewBox="0 0 24 24" style="stroke:#0F9D8A;"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
-                            <span>Live Events & Opportunities</span>
-                            <span style="font-size: 14px; color: #64748B; font-weight: 600;">(<?= $totalOpenOpportunities ?> available)</span>
-                        </h2>
-                        <span style="font-size: 13px; color: #64748B;">
-                            Verified competitions, workshops, and sprints in <strong><?= e($currentCity) ?></strong> and virtual platforms
-                        </span>
+            <?php if (!$isCategoryView): ?>
+                <!-- =============================================================
+                     SCREEN 1: ACTIVITY CATEGORIES (TILES ONLY)
+                     ============================================================= -->
+                <div class="discovery-hero">
+                    <div class="career-track-pill">
+                        <span>Extracurricular Discovery</span> • <span><?= $isAllIndia ? 'All India Scope' : e($selectedState) ?></span>
+                    </div>
+                    <h1 class="discovery-title">Discover Opportunities. Build Your Future.</h1>
+                    <p class="discovery-subtitle">
+                        Explore extracurricular activities that match your interests, develop your skills, and bring you closer to your dream career.
+                    </p>
+                    <div style="margin-top: 16px;">
+                        <form method="POST" action="activities.php" style="display:inline;">
+                            <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
+                            <input type="hidden" name="run_ai_discovery" value="1">
+                            <button type="submit" class="hero-btn-white" style="display:inline-flex; align-items:center; gap:8px; background:rgba(255,255,255,0.25); color:#fff; border:1px solid rgba(255,255,255,0.45); backdrop-filter:blur(8px); padding:10px 20px; border-radius:30px; font-weight:700; cursor:pointer;">
+                                ✦ Run AI Activity Discovery
+                            </button>
+                        </form>
                     </div>
                 </div>
 
-                <!-- Active Filter Banner if filtered by activity -->
-                <?php if ($filterActivity > 0 && $selectedActivityTitle): ?>
-                    <div style="background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 10px; padding: 12px 16px; margin-bottom: 18px; display: flex; align-items: center; justify-content: space-between;">
-                        <span style="font-size: 13px; color: #166534; font-weight: 600;">
-                            Filtering opportunities for activity: <strong><?= e($selectedActivityTitle) ?></strong>
-                        </span>
-                        <a href="activities.php?city=<?= urlencode($currentCity) ?>" style="font-size: 12.5px; font-weight: 700; color: #15803D; text-decoration: none;">
-                            Clear Filter &times;
-                        </a>
+                <?php if (!empty($aiDiscoveryProgress)): ?>
+                    <div style="background:#FFFFFF; border:1px solid #BFDBFE; border-radius:14px; padding:20px 24px; margin-bottom:24px; box-shadow:0 4px 16px rgba(23,105,232,0.06);">
+                        <div style="font-size:14px; font-weight:800; color:#163A70; margin-bottom:12px; display:flex; align-items:center; gap:8px;">
+                            <span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#10B981;"></span>
+                            AI Opportunity Discovery Progress
+                        </div>
+                        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:10px;">
+                            <?php foreach ($aiDiscoveryProgress as $step): ?>
+                                <div style="display:flex; align-items:center; gap:8px; font-size:12.5px; color:#334155; background:#F8FAFC; padding:8px 12px; border-radius:8px; border:1px solid #E2E8F0;">
+                                    <span style="color:#059669; font-weight:800;">✓</span>
+                                    <span><?= e($step['text']) ?></span>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
                     </div>
                 <?php endif; ?>
 
-                <!-- Filters & Search Toolbar -->
-                <div class="filter-toolbar">
-                    <form action="activities.php" method="GET" class="search-field-wrap">
-                        <input type="hidden" name="city" value="<?= e($currentCity) ?>">
-                        <?php if ($filterActivity > 0): ?>
-                            <input type="hidden" name="activity_id" value="<?= $filterActivity ?>">
-                        <?php endif; ?>
-                        
-                        <span class="search-icon" style="position: absolute; left: 12px; top: 12px; color: #94A3B8;">
-                            <svg width="16" height="16" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                <!-- Category Search Bar -->
+                <form method="GET" action="activities.php" class="category-search-bar">
+                    <input type="hidden" name="state" value="<?= e($selectedState) ?>">
+                    <input type="hidden" name="city" value="<?= e($selectedCity) ?>">
+                    <div class="cat-search-input-wrapper">
+                        <span class="cat-search-icon">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
                         </span>
-                        <input 
-                            type="text" 
-                            name="q" 
-                            class="search-field-input" 
-                            placeholder="Search by event title, organizer, or venue..."
-                            value="<?= e($searchQuery) ?>"
-                        >
-                    </form>
+                        <input type="text" name="cat_q" class="cat-search-input" placeholder="Find hackathons, competitions, workshops, and more..." value="<?= e($categorySearchQuery ?? '') ?>">
+                    </div>
+                    <button type="submit" class="hero-btn-white" style="background:#1769E8; color:#fff; border:none; height:44px; padding:0 20px; font-weight:700; border-radius:10px; cursor:pointer;">
+                        Filter Tiles
+                    </button>
+                </form>
 
-                    <div class="filter-controls-group">
-                        <!-- Mode Filter -->
-                        <select class="filter-select" onchange="location = this.value;">
-                            <option value="<?= e('activities.php?' . http_build_query(array_merge($_GET, ['mode' => 'all']))) ?>" <?= $filterMode === 'all' ? 'selected' : '' ?>>All Formats</option>
-                            <option value="<?= e('activities.php?' . http_build_query(array_merge($_GET, ['mode' => 'offline']))) ?>" <?= $filterMode === 'offline' ? 'selected' : '' ?>>In-Person / Offline</option>
-                            <option value="<?= e('activities.php?' . http_build_query(array_merge($_GET, ['mode' => 'online']))) ?>" <?= $filterMode === 'online' ? 'selected' : '' ?>>Online / Virtual</option>
-                            <option value="<?= e('activities.php?' . http_build_query(array_merge($_GET, ['mode' => 'hybrid']))) ?>" <?= $filterMode === 'hybrid' ? 'selected' : '' ?>>Hybrid</option>
-                        </select>
+                <!-- Category Tiles Grid -->
+                <div class="category-tiles-grid">
+                    <?php foreach ($categoriesCatalog as $cat): 
+                        $code = (string)$cat['code'];
+                    ?>
+                        <a href="activities.php?category=<?= urlencode($code) ?>&state=<?= urlencode($selectedState) ?>&city=<?= urlencode($selectedCity) ?>" class="category-tile-card" id="catTile_<?= strtolower(e($cat['code'])) ?>">
+                            <div>
+                                <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                                    <div class="tile-icon-box" style="background: <?= e($cat['bg_color']) ?>; border: 1px solid <?= e($cat['border_color']) ?>; color: <?= e($cat['icon_color']) ?>;">
+                                        <?= $cat['icon_svg'] ?>
+                                    </div>
+                                    <?php if ($cat['is_recommended']): ?>
+                                        <span class="tile-rec-badge">Recommended</span>
+                                    <?php endif; ?>
+                                </div>
+                                <h2 class="tile-category-name"><?= e($cat['name']) ?></h2>
+                            </div>
 
-                        <!-- Cost Filter -->
-                        <select class="filter-select" onchange="location = this.value;">
-                            <option value="<?= e('activities.php?' . http_build_query(array_merge($_GET, ['cost' => 'all']))) ?>" <?= $filterCost === 'all' ? 'selected' : '' ?>>All Prices</option>
-                            <option value="<?= e('activities.php?' . http_build_query(array_merge($_GET, ['cost' => 'free']))) ?>" <?= $filterCost === 'free' ? 'selected' : '' ?>>Free Registration</option>
-                            <option value="<?= e('activities.php?' . http_build_query(array_merge($_GET, ['cost' => 'paid']))) ?>" <?= $filterCost === 'paid' ? 'selected' : '' ?>>Paid / Ticketed</option>
-                        </select>
+                            <div class="tile-bottom-meta">
+                                <span class="tile-opps-count">
+                                    <span class="tile-opps-dot"></span>
+                                    <?= (int)$cat['verified_opps_count'] ?> Verified in Catalog
+                                </span>
+                                <span class="tile-explore-link">
+                                    <span>Explore</span>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                                </span>
+                            </div>
+                        </a>
+                    <?php endforeach; ?>
+                </div>
 
-                        <?php if ($searchQuery !== '' || $filterMode !== 'all' || $filterCost !== 'all' || $filterActivity > 0): ?>
-                            <a href="activities.php?city=<?= urlencode($currentCity) ?>" class="btn-clear-filters">
-                                Reset Filters
-                            </a>
-                        <?php endif; ?>
+            <?php else: ?>
+                <!-- =============================================================
+                     SCREEN 2: CATEGORY OPPORTUNITY LISTING
+                     ============================================================= -->
+
+                <!-- Breadcrumb Navigation -->
+                <div class="breadcrumb-nav">
+                    <a href="activities.php?state=<?= urlencode($selectedState) ?>&city=<?= urlencode($selectedCity) ?>" class="breadcrumb-link">&larr; Back to Explore Activities</a>
+                    <span class="breadcrumb-sep">&bull;</span>
+                    <span class="breadcrumb-current"><?= e($selectedCategory['name']) ?> Opportunities</span>
+                </div>
+
+                <!-- Category Header Banner -->
+                <div class="category-header-banner">
+                    <div class="cat-header-left">
+                        <div class="cat-header-icon-box" style="background: <?= e($selectedCategory['bg_color']) ?>; border: 1px solid <?= e($selectedCategory['border_color']) ?>; color: <?= e($selectedCategory['icon_color']) ?>;">
+                            <?= $selectedCategory['icon_svg'] ?>
+                        </div>
+                        <div>
+                            <h1 class="cat-header-title"><?= e($selectedCategory['name']) ?> in India</h1>
+                            <p class="cat-header-subtitle">
+                                Showing verified extracurricular opportunities conducted across <?= $isAllIndia ? 'all states and national hubs in India' : e($selectedState) . ' (' . e($selectedCity) . ')' ?> and India-eligible online tracks.
+                            </p>
+                        </div>
+                    </div>
+                    <div>
+                        <span class="cat-opps-badge">
+                            <?= (int)$totalOpenOpportunities ?> Verified Listings
+                        </span>
                     </div>
                 </div>
 
-                <!-- Opportunities List Grid -->
-                <?php if (empty($opportunitiesList)): ?>
-                    <div class="empty-discovery-state">
-                        <div class="empty-icon">
-                            <svg width="24" height="24" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                <!-- Gemini AI Opportunity Discovery & Intelligence Panel -->
+                <?php if ($aiDiscoveryInsights): ?>
+                    <div class="ai-discovery-box">
+                        <div class="ai-status-row">
+                            <span class="ai-status-pill">
+                                <?= $aiDiscoveryInsights['is_live_ai'] ? '✦ Gemini AI Discovery Engine (India Coverage)' : '✓ Verified Database Records (Live Discovery Fallback Active)' ?>
+                            </span>
+                            <span style="font-size: 12px; color: #64748B; font-weight: 600;">
+                                Region: <?= e($aiDiscoveryInsights['location_display']) ?>
+                            </span>
                         </div>
-                        <h3 class="empty-title">No matching opportunities found</h3>
-                        <p class="empty-desc">
-                            We couldn't find any open events matching your current filters in <strong><?= e($currentCity) ?></strong>. Try switching to "All Hubs" or clearing filter criteria.
+
+                        <div class="ai-summary-text">
+                            <?= e($aiDiscoveryInsights['summary']) ?>
+                        </div>
+
+                        <div class="ai-insights-split">
+                            <div class="ai-insight-block">
+                                <div class="ai-block-title">Key Active Academic & Regional Hubs</div>
+                                <ul class="ai-list-bullet">
+                                    <?php foreach ($aiDiscoveryInsights['top_hubs'] as $hub): ?>
+                                        <li><?= e($hub) ?></li>
+                                    <?php endforeach; ?>
+                                </ul>
+                            </div>
+                            <div class="ai-insight-block">
+                                <div class="ai-block-title">Collegiate Preparation & Eligibility Advice</div>
+                                <ul class="ai-list-bullet">
+                                    <?php foreach ($aiDiscoveryInsights['prep_tips'] as $tip): ?>
+                                        <li><?= e($tip) ?></li>
+                                    <?php endforeach; ?>
+                                </ul>
+                            </div>
+                        </div>
+
+                        <?php if (!empty($aiDiscoveryInsights['official_portals'])): ?>
+                            <div style="font-size: 12px; color: #475569; margin-bottom: 8px;">
+                                <strong>Official Portals to Monitor:</strong>
+                                <?php foreach ($aiDiscoveryInsights['official_portals'] as $port): ?>
+                                    <a href="<?= e($port['url']) ?>" target="_blank" rel="noopener noreferrer" style="margin-right: 12px; color: #1769E8; font-weight: 700; text-decoration: underline;">
+                                        <?= e($port['name']) ?> &#8599;
+                                    </a>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php endif; ?>
+
+                        <div class="ai-disclaimer-note">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+                            <span><?= e($aiDiscoveryInsights['disclaimer']) ?></span>
+                        </div>
+                    </div>
+                <?php endif; ?>
+
+                <!-- Filter & Search Control Panel -->
+                <form method="GET" action="activities.php" class="discovery-filter-panel">
+                    <input type="hidden" name="category" value="<?= e($selectedCategory['code']) ?>">
+                    <input type="hidden" name="state" value="<?= e($selectedState) ?>">
+                    <input type="hidden" name="city" value="<?= e($selectedCity) ?>">
+
+                    <div class="filter-row-top">
+                        <div class="filter-search-box">
+                            <input type="text" name="q" class="filter-search-input" placeholder="Search <?= e($selectedCategory['name']) ?> (e.g. Smart India, Shaastra, IoT, AI)..." value="<?= e($oppSearchQuery ?? '') ?>">
+                        </div>
+
+                        <select name="scope" class="filter-select">
+                            <option value="all" <?= ($filterScope === 'all') ? 'selected' : '' ?>>All Scopes</option>
+                            <option value="national" <?= ($filterScope === 'national') ? 'selected' : '' ?>>National Level (All India)</option>
+                            <option value="state" <?= ($filterScope === 'state') ? 'selected' : '' ?>>State Level</option>
+                            <option value="local" <?= ($filterScope === 'local') ? 'selected' : '' ?>>Local Hub Only</option>
+                            <option value="international_eligible" <?= ($filterScope === 'international_eligible') ? 'selected' : '' ?>>India-Eligible Online</option>
+                        </select>
+
+                        <select name="mode" class="filter-select">
+                            <option value="all" <?= ($filterMode === 'all') ? 'selected' : '' ?>>All Formats</option>
+                            <option value="offline" <?= ($filterMode === 'offline') ? 'selected' : '' ?>>In-Person (Offline)</option>
+                            <option value="online" <?= ($filterMode === 'online') ? 'selected' : '' ?>>Online / Virtual</option>
+                            <option value="hybrid" <?= ($filterMode === 'hybrid') ? 'selected' : '' ?>>Hybrid</option>
+                        </select>
+
+                        <select name="deadline" class="filter-select">
+                            <option value="all" <?= ($filterDeadline === 'all') ? 'selected' : '' ?>>All Deadlines</option>
+                            <option value="closing_soon" <?= ($filterDeadline === 'closing_soon') ? 'selected' : '' ?>>Closing Soon (&le; 7 Days)</option>
+                            <option value="this_month" <?= ($filterDeadline === 'this_month') ? 'selected' : '' ?>>Upcoming This Month</option>
+                        </select>
+
+                        <select name="cost" class="filter-select">
+                            <option value="all" <?= ($filterCost === 'all') ? 'selected' : '' ?>>All Costs</option>
+                            <option value="free" <?= ($filterCost === 'free') ? 'selected' : '' ?>>Free to Enter</option>
+                            <option value="paid" <?= ($filterCost === 'paid') ? 'selected' : '' ?>>Paid / Subsidized</option>
+                        </select>
+
+                        <button type="submit" class="hero-btn-white" style="background:#1769E8; color:#fff; border:none; height:42px; padding:0 18px; font-weight:700; border-radius:10px; cursor:pointer;">
+                            Apply Filters
+                        </button>
+                    </div>
+                </form>
+
+                <!-- Opportunity Listings Grid -->
+                <?php if (empty($opportunitiesList)): ?>
+                    <div style="background:#FFF; border:1px solid #E2E8F0; border-radius:14px; padding:48px 24px; text-align:center; max-width:680px; margin:20px auto;">
+                        <div style="width:56px; height:56px; background:#EEF4FF; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; margin-bottom:16px;">
+                            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#1769E8" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                        </div>
+                        <h2 style="font-size:18px; font-weight:800; color:#0F172A; margin:0 0 8px 0;">No Verified Opportunities Found</h2>
+                        <p style="color:#64748B; font-size:13.5px; line-height:1.5; margin-bottom:20px;">
+                            No verified opportunities found for this category and location in <?= e($selectedCity !== 'all' ? "{$selectedCity}, {$selectedState}" : $selectedState) ?>. Try selecting "All India" or clearing the format and deadline filters.
                         </p>
-                        <a href="activities.php?city=All" class="btn-filter-events" style="display:inline-flex;">
-                            Browse All Cities & Online Opportunities
+                        <a href="activities.php?category=<?= urlencode($selectedCategory['code']) ?>&state=All+India" class="loc-apply-btn" style="display:inline-flex;">
+                            Search All India Opportunities &rarr;
                         </a>
                     </div>
                 <?php else: ?>
-                    <div class="opportunities-grid">
-                        <?php foreach ($opportunitiesList as $opp): ?>
-                            <?php 
-                                $isClosingSoon = $opp['is_closing_soon'];
-                                $isEnrolled = $opp['is_enrolled'];
-                                $enrollmentStatus = $opp['enrollment_status'];
-                                $costLabel = (empty($opp['cost_amount']) || (float)$opp['cost_amount'] == 0) 
-                                    ? 'Free' 
-                                    : ($opp['cost_currency'] . ' ' . number_format((float)$opp['cost_amount'], 2));
-                            ?>
-                            <div class="event-card">
+                    <div class="opps-cards-grid">
+                        <?php foreach ($opportunitiesList as $opp): 
+                            $scope = (string)($opp['scope_level'] ?? 'local');
+                            $scopeClass = 'scope-local';
+                            $scopeLabel = 'Local Hub';
+                            if ($scope === 'national') {
+                                $scopeClass = 'scope-national';
+                                $scopeLabel = 'National Level (All India)';
+                            } elseif ($scope === 'state') {
+                                $scopeClass = 'scope-state';
+                                $scopeLabel = 'State Level (' . ($opp['state_name'] ?? 'State') . ')';
+                            } elseif ($scope === 'international_eligible' || !empty($opp['is_international_eligible'])) {
+                                $scopeClass = 'scope-intl';
+                                $scopeLabel = 'International Online (Eligible for India)';
+                            }
+                        ?>
+                            <article class="opportunity-card opp-card">
                                 <div>
-                                    <div class="event-card-top">
-                                        <span class="event-format-pill <?= e($opp['delivery_mode']) ?>">
-                                            <?php if ($opp['delivery_mode'] === 'online'): ?>
-                                                <svg width="12" height="12" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line></svg>
-                                                <span>Online</span>
-                                            <?php elseif ($opp['delivery_mode'] === 'offline'): ?>
-                                                <svg width="12" height="12" viewBox="0 0 24 24"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>
-                                                <span><?= e($opp['city_name']) ?></span>
-                                            <?php else: ?>
-                                                <svg width="12" height="12" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-                                                <span>Hybrid • <?= e($opp['city_name']) ?></span>
+                                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
+                                        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                                            <span class="opp-scope-pill <?= $scopeClass ?>">
+                                                <?= e($scopeLabel) ?>
+                                            </span>
+                                            <?php if (!empty($opp['match_score'])): ?>
+                                                <span style="font-size:11px; font-weight:800; color:#065F46; background:#ECFDF5; border:1px solid #A7F3D0; padding:2px 8px; border-radius:12px;">
+                                                    ✦ <?= (int)$opp['match_score'] ?>% Match
+                                                </span>
                                             <?php endif; ?>
-                                        </span>
-
-                                        <?php if ($opp['days_remaining'] !== null): ?>
-                                            <span class="deadline-countdown-badge <?= $isClosingSoon ? 'urgent' : 'normal' ?>">
-                                                <?= $opp['days_remaining'] === 0 ? 'Closes Today' : ($opp['days_remaining'] === 1 ? '1 day left' : $opp['days_remaining'] . ' days left') ?>
+                                        </div>
+                                        <?php if ($opp['days_remaining'] !== null && $opp['days_remaining'] <= 7): ?>
+                                            <span style="font-size:10.5px; font-weight:800; color:#DC2626; background:#FEF2F2; border:1px solid #FECACA; padding:2px 8px; border-radius:10px;">
+                                                Closing Soon (<?= (int)$opp['days_remaining'] ?>d)
                                             </span>
                                         <?php endif; ?>
                                     </div>
 
-                                    <h3 class="event-title"><?= e($opp['title']) ?></h3>
-                                    
-                                    <div class="event-organizer">
-                                        <svg width="14" height="14" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
-                                        <span><?= e($opp['organizer_name']) ?></span>
+                                    <h3 class="opp-card-title"><?= e($opp['title']) ?></h3>
+
+                                    <div class="opp-organizer-row">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#16A34A" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+                                        <span>Organizer: <strong><?= e($opp['organizer_name']) ?></strong></span>
                                     </div>
 
-                                    <p class="event-desc"><?= e($opp['description']) ?></p>
-
-                                    <!-- Event Metadata Table -->
-                                    <div class="event-meta-table">
-                                        <?php if (!empty($opp['venue'])): ?>
-                                            <div class="event-meta-row">
-                                                <span>Venue:</span>
-                                                <strong title="<?= e($opp['venue']) ?>" style="max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"><?= e($opp['venue']) ?></strong>
-                                            </div>
-                                        <?php endif; ?>
-                                        <?php if (!empty($opp['start_date'])): ?>
-                                            <div class="event-meta-row">
-                                                <span>Event Dates:</span>
-                                                <strong><?= date('M j, Y', strtotime($opp['start_date'])) ?><?= !empty($opp['end_date']) && $opp['end_date'] !== $opp['start_date'] ? ' – ' . date('M j, Y', strtotime($opp['end_date'])) : '' ?></strong>
-                                            </div>
-                                        <?php endif; ?>
-                                        <?php if (!empty($opp['registration_deadline'])): ?>
-                                            <div class="event-meta-row">
-                                                <span>Register by:</span>
-                                                <strong style="color: <?= $isClosingSoon ? '#DC2626' : '#163A70' ?>;"><?= date('M j, Y', strtotime($opp['registration_deadline'])) ?></strong>
-                                            </div>
-                                        <?php endif; ?>
-                                        <div class="event-meta-row">
-                                            <span>Registration Fee:</span>
-                                            <strong style="color: <?= $costLabel === 'Free' ? '#059669' : '#163A70' ?>;"><?= e($costLabel) ?></strong>
+                                    <div class="opp-meta-table">
+                                        <div class="opp-meta-row">
+                                            <span>Location:</span>
+                                            <strong><?= e($opp['city_name']) ?><?= !empty($opp['state_name']) ? ', ' . e($opp['state_name']) : '' ?></strong>
+                                        </div>
+                                        <div class="opp-meta-row">
+                                            <span>Format:</span>
+                                            <strong style="text-transform:capitalize;"><?= e($opp['delivery_mode']) ?></strong>
+                                        </div>
+                                        <div class="opp-meta-row">
+                                            <span>Registration Deadline:</span>
+                                            <strong><?= !empty($opp['registration_deadline']) ? date('M j, Y', strtotime($opp['registration_deadline'])) : 'Open' ?></strong>
+                                        </div>
+                                        <div class="opp-meta-row">
+                                            <span>Cost:</span>
+                                            <strong><?= ((float)$opp['cost_amount'] > 0) ? '₹' . number_format((float)$opp['cost_amount'], 2) : 'Free' ?></strong>
                                         </div>
                                     </div>
+
+                                    <div class="opp-desc-text">
+                                        <?= e($opp['description'] ?? 'Verified extracurricular opportunity.') ?>
+                                    </div>
+
+                                    <?php if (!empty($opp['eligibility'])): ?>
+                                        <div class="opp-elig-box">
+                                            <strong>Eligibility:</strong> <?= e($opp['eligibility']) ?>
+                                        </div>
+                                    <?php endif; ?>
                                 </div>
 
-                                <!-- Action Buttons -->
-                                <div class="event-card-actions">
-                                    <!-- Official Registration CTA -->
-                                    <a 
-                                        href="<?= e($opp['registration_url'] ?: $opp['source_url'] ?: 'https://unstop.com') ?>" 
-                                        target="_blank" 
-                                        rel="noopener noreferrer" 
-                                        class="btn-register-official"
-                                        title="Open official registration portal in a new tab"
-                                    >
-                                        <span>Register on Website</span>
-                                        <svg width="14" height="14" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-                                    </a>
+                                <div class="opp-actions-row">
+                                    <?php if (!empty($opp['registration_url'])): ?>
+                                        <a href="<?= e($opp['registration_url']) ?>" target="_blank" rel="noopener noreferrer" class="opp-official-link">
+                                            <span>Official Portal</span>
+                                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="7" y1="17" x2="17" y2="7"></line><polyline points="7 7 17 7 17 17"></polyline></svg>
+                                        </a>
+                                    <?php else: ?>
+                                        <span></span>
+                                    <?php endif; ?>
 
-                                    <!-- Save Opportunity Action Form -->
-                                    <form action="activities.php?<?= http_build_query($_GET) ?>" method="POST" style="margin: 0;">
-                                        <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
-                                        <input type="hidden" name="enroll_opp_id" value="<?= $opp['id'] ?>">
-                                        <input type="hidden" name="activity_id" value="<?= $opp['activity_id'] ?>">
-                                        
-                                        <?php if ($isEnrolled && $enrollmentStatus === 'saved'): ?>
-                                            <button type="submit" name="action_type" value="registered" class="btn-save-opp saved" title="Saved! Click to mark as registered">
-                                                <svg width="14" height="14" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                                <span>Saved</span>
-                                            </button>
-                                        <?php elseif ($isEnrolled && $enrollmentStatus === 'registered'): ?>
-                                            <button type="button" class="btn-save-opp saved" style="cursor: default;" title="You are registered for this opportunity">
-                                                <svg width="14" height="14" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                                <span>Registered</span>
-                                            </button>
+                                    <div style="display:flex; align-items:center; gap:8px;">
+                                        <a href="activity_details.php?id=<?= (int)$opp['activity_id'] ?>&opp_id=<?= (int)$opp['id'] ?>" class="btn-view-details" style="padding: 6px 12px; font-size: 11.5px; text-decoration: none;">
+                                            View Details &rarr;
+                                        </a>
+                                        <?php if ($opp['is_enrolled']): ?>
+                                            <span class="opp-badge-saved">
+                                                <?= ($opp['enrollment_status'] === 'registered') ? '✓ Enrolled' : '★ Saved' ?>
+                                            </span>
                                         <?php else: ?>
-                                            <button type="submit" name="action_type" value="saved" class="btn-save-opp" title="Save this opportunity to your portal">
-                                                <svg width="14" height="14" viewBox="0 0 24 24"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
-                                                <span>Save</span>
-                                            </button>
+                                            <form method="POST" action="activities.php" style="display:inline;">
+                                                <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
+                                                <input type="hidden" name="enroll_opp_id" value="<?= (int)$opp['id'] ?>">
+                                                <input type="hidden" name="activity_id" value="<?= (int)$opp['activity_id'] ?>">
+                                                <input type="hidden" name="action_type" value="saved">
+                                                <button type="submit" class="opp-btn-action opp-btn-save" title="Save to your personal portal">Save</button>
+                                            </form>
+                                            <form method="POST" action="activities.php" style="display:inline;">
+                                                <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
+                                                <input type="hidden" name="enroll_opp_id" value="<?= (int)$opp['id'] ?>">
+                                                <input type="hidden" name="activity_id" value="<?= (int)$opp['activity_id'] ?>">
+                                                <input type="hidden" name="action_type" value="registered">
+                                                <button type="submit" class="opp-btn-action opp-btn-enroll">Enroll</button>
+                                            </form>
                                         <?php endif; ?>
-                                    </form>
+                                    </div>
                                 </div>
-                            </div>
+                            </article>
                         <?php endforeach; ?>
                     </div>
                 <?php endif; ?>
 
-            </section>
+                <!-- Strict Separation Notice Footer -->
+                <div style="background:#F8FAFC; border:1px solid #E2E8F0; border-radius:10px; padding:18px 24px; font-size:13px; color:#64748B; line-height:1.5; margin-bottom:32px;">
+                    <strong style="color:#334155;">Important Separation Notice:</strong>
+                    Saving or enrolling in an opportunity adds it to your <em>Saved Activities</em> or <em>My Enrollments</em> portal for milestone tracking. It is strictly a future activity and does <strong>not</strong> mark it as completed or add it to <em>My Existing Activities & Skills</em> until you provide verified completion evidence.
+                </div>
+
+            <?php endif; ?>
 
         </main>
     </div>
 
-    <!-- UI Interaction Script -->
+    <!-- Dynamic City Dropdown Updater -->
     <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            // Mobile Menu Toggle
-            const mobileBtn = document.getElementById('mobileMenuBtn');
-            const sidebar = document.getElementById('dashboardSidebar');
-            const overlay = document.getElementById('sidebarOverlay');
+        const indianStates = <?= json_encode($indianStatesData) ?>;
 
-            if (mobileBtn && sidebar && overlay) {
-                mobileBtn.addEventListener('click', function(e) {
-                    e.stopPropagation();
-                    sidebar.classList.toggle('open');
-                    overlay.classList.toggle('show');
-                });
+        function updateCityDropdown(selectedState) {
+            const citySelect = document.getElementById('citySelect');
+            if (!citySelect) return;
 
-                overlay.addEventListener('click', function() {
-                    sidebar.classList.remove('open');
-                    overlay.classList.remove('show');
+            citySelect.innerHTML = '<option value="all">All Cities / Districts</option>';
+
+            if (selectedState && indianStates[selectedState] && indianStates[selectedState].cities) {
+                indianStates[selectedState].cities.forEach(city => {
+                    const opt = document.createElement('option');
+                    opt.value = city;
+                    opt.textContent = city;
+                    citySelect.appendChild(opt);
                 });
             }
-        });
+        }
+
+        function setDefaultCity(cityName) {
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = 'activities.php';
+
+            const csrfInput = document.createElement('input');
+            csrfInput.type = 'hidden';
+            csrfInput.name = 'csrf_token';
+            csrfInput.value = '<?= e($csrfToken) ?>';
+            form.appendChild(csrfInput);
+
+            const cityInput = document.createElement('input');
+            cityInput.type = 'hidden';
+            cityInput.name = 'set_preferred_city';
+            cityInput.value = cityName;
+            form.appendChild(cityInput);
+
+            document.body.appendChild(form);
+            form.submit();
+        }
     </script>
 </body>
 </html>

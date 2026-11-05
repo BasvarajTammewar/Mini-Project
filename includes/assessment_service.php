@@ -18,23 +18,110 @@ class AssessmentService
     }
 
     /**
+     * Retrieves the strict list of assessable skills explicitly claimed by the authenticated student
+     * in student_skills or linked to their verified past activities in student_existing_activities.
+     *
+     * EXPLICITLY DOES NOT infer skills from career goals, future recommendations, or unverified profile fields.
+     */
+    public function getStrictAllowedSkills(int $userId): array
+    {
+        // A. Skills explicitly entered by student in student_skills
+        $stmtClaimed = $this->db->prepare("
+            SELECT 
+                ss.skill_id,
+                s.name AS skill_name,
+                s.description,
+                s.category_id,
+                COALESCE(sc.name, 'General') AS category_name,
+                ss.level AS current_level,
+                ss.source AS skill_source,
+                'student_skills' AS origin
+            FROM student_skills ss
+            JOIN skills s ON ss.skill_id = s.id
+            LEFT JOIN skill_categories sc ON s.category_id = sc.id
+            WHERE ss.user_id = :user_id AND s.is_active = 1
+            ORDER BY s.name ASC
+        ");
+        $stmtClaimed->execute([':user_id' => $userId]);
+        $claimed = $stmtClaimed->fetchAll(PDO::FETCH_ASSOC);
+
+        // B. Skills linked to student's existing activities in student_existing_activities
+        $stmtActSkills = $this->db->prepare("
+            SELECT DISTINCT
+                ask.skill_id,
+                s.name AS skill_name,
+                s.description,
+                s.category_id,
+                COALESCE(sc.name, 'General') AS category_name,
+                ask.gain_level AS current_level,
+                'self_reported' AS skill_source,
+                'student_existing_activities' AS origin
+            FROM student_existing_activities sea
+            JOIN activity_skills ask ON sea.activity_id = ask.activity_id
+            JOIN skills s ON ask.skill_id = s.id
+            LEFT JOIN skill_categories sc ON s.category_id = sc.id
+            WHERE sea.user_id = :user_id AND s.is_active = 1
+            ORDER BY s.name ASC
+        ");
+        $stmtActSkills->execute([':user_id' => $userId]);
+        $actSkills = $stmtActSkills->fetchAll(PDO::FETCH_ASSOC);
+
+        // Combine and index by skill_id
+        $allowed = [];
+        foreach ($claimed as $c) {
+            $allowed[(int)$c['skill_id']] = $c;
+        }
+        foreach ($actSkills as $a) {
+            $sId = (int)$a['skill_id'];
+            if (!isset($allowed[$sId])) {
+                $allowed[$sId] = $a;
+            }
+        }
+
+        return $allowed;
+    }
+
+    /**
+     * Validates whether a specific skill is eligible to be assessed for the student
+     */
+    public function isSkillEligibleForAssessment(int $userId, int $skillId): bool
+    {
+        $allowed = $this->getStrictAllowedSkills($userId);
+        return isset($allowed[$skillId]);
+    }
+
+    /**
+     * Retrieves the student's existing activities to provide realistic context for question generation
+     */
+    public function getStudentExistingActivitiesContext(int $userId): array
+    {
+        $stmt = $this->db->prepare("
+            SELECT 
+                sea.id,
+                sea.title,
+                sea.role,
+                sea.description,
+                sea.start_date,
+                sea.end_date,
+                a.title AS catalog_title
+            FROM student_existing_activities sea
+            LEFT JOIN activities a ON sea.activity_id = a.id
+            WHERE sea.user_id = :user_id
+            ORDER BY sea.start_date DESC
+        ");
+        $stmt->execute([':user_id' => $userId]);
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    /**
      * Identifies all assessable skills for a student, categorized by Soft, Technical, and Professional
      */
     public function getStudentAssessableSkills(int $userId): array
     {
-        // 1. Student's self-reported/existing skills
-        $stmtMySkills = $this->db->prepare("
-            SELECT skill_id, level, source
-            FROM student_skills
-            WHERE user_id = :user_id
-        ");
-        $stmtMySkills->execute([':user_id' => $userId]);
-        $mySkills = [];
-        while ($row = $stmtMySkills->fetch()) {
-            $mySkills[(int)$row['skill_id']] = $row;
-        }
+        // 1. Strict allowed skills claimed by the student
+        $allowedSkills = $this->getStrictAllowedSkills($userId);
 
-        // 2. Career required skills from student's active primary goal
+        // 2. Career required skills from student's active primary goal (context only, NOT assessable unless in allowed)
         $stmtCareerSkills = $this->db->prepare("
             SELECT cs.skill_id, cs.required_level, cs.importance, cg.title AS career_title
             FROM student_career_goals scg
@@ -52,23 +139,7 @@ class AssessmentService
             }
         }
 
-        // 3. Activity-associated skills from student enrollments/activities
-        $stmtActSkills = $this->db->prepare("
-            SELECT DISTINCT ask.skill_id
-            FROM enrollments e
-            JOIN activity_skills ask ON e.activity_id = ask.activity_id
-            WHERE e.user_id = :user_id
-            UNION
-            SELECT DISTINCT ask.skill_id
-            FROM student_existing_activities sea
-            JOIN activity_skills ask ON sea.activity_id = ask.activity_id
-            WHERE sea.user_id = :user_id2
-        ");
-        $stmtActSkills->execute([':user_id' => $userId, ':user_id2' => $userId]);
-        $activitySkillIds = $stmtActSkills->fetchAll(PDO::FETCH_COLUMN);
-        $activitySkillIds = array_flip(array_map('intval', $activitySkillIds));
-
-        // 4. Latest AI assessment history per skill
+        // 3. Latest AI assessment history per skill
         $stmtAssess = $this->db->prepare("
             SELECT 
                 a.id AS assessment_id,
@@ -92,7 +163,7 @@ class AssessmentService
             $latestAssessments[(int)$row['skill_id']] = $row;
         }
 
-        // 5. Total attempts count per skill
+        // 4. Total attempts count per skill
         $stmtAttempts = $this->db->prepare("
             SELECT skill_id, COUNT(*) AS attempts_count
             FROM ai_skill_assessments
@@ -102,22 +173,7 @@ class AssessmentService
         $stmtAttempts->execute([':user_id' => $userId]);
         $attemptsCounts = $stmtAttempts->fetchAll(PDO::FETCH_KEY_PAIR);
 
-        // 6. Fetch all active skills in carrearact2
-        $stmtAllSkills = $this->db->query("
-            SELECT 
-                s.id AS skill_id,
-                s.name AS skill_name,
-                s.description,
-                s.category_id,
-                COALESCE(sc.name, 'General') AS category_name
-            FROM skills s
-            LEFT JOIN skill_categories sc ON s.category_id = sc.id
-            WHERE s.is_active = 1
-            ORDER BY sc.name ASC, s.name ASC
-        ");
-        $allSkills = $stmtAllSkills->fetchAll();
-
-        // Categorize each skill into standard clusters: Soft, Technical, Professional
+        // Categorize each assessable skill into standard clusters: Soft, Technical, Professional
         $categorized = [
             'soft'         => [],
             'technical'    => [],
@@ -126,26 +182,24 @@ class AssessmentService
         ];
 
         $summary = [
-            'total_skills'          => count($allSkills),
-            'student_skills_count'  => count($mySkills),
-            'assessed_skills_count' => count($latestAssessments),
-            'pending_skills_count'  => max(0, count($mySkills) - count($latestAssessments)),
+            'total_skills'          => count($allowedSkills),
+            'student_skills_count'  => count($allowedSkills),
+            'assessed_skills_count' => 0,
+            'pending_skills_count'  => 0,
             'average_score'         => 0.0,
-            'career_title'          => $activeCareerTitle
+            'career_title'          => $activeCareerTitle,
+            'has_assessable_skills' => !empty($allowedSkills),
+            'allowed_skill_ids'     => array_keys($allowedSkills)
         ];
 
         $totalScoreSum = 0;
         $scoredCount = 0;
 
-        foreach ($allSkills as $sk) {
-            $sId = (int)$sk['skill_id'];
+        foreach ($allowedSkills as $sId => $sk) {
             $name = $sk['skill_name'];
             $catName = $sk['category_name'];
 
-            $isMySkill = isset($mySkills[$sId]);
             $isCareerReq = isset($careerSkills[$sId]);
-            $isActLinked = isset($activitySkillIds[$sId]);
-
             $latest = $latestAssessments[$sId] ?? null;
             $hasAssessed = ($latest !== null);
             $score = $hasAssessed ? (float)$latest['overall_score'] : null;
@@ -164,12 +218,12 @@ class AssessmentService
                 'description'          => $sk['description'] ?? '',
                 'category_name'        => $catName,
                 'cluster'              => $cluster,
-                'is_my_skill'          => $isMySkill,
-                'current_level'        => $isMySkill ? (int)$mySkills[$sId]['level'] : 0,
-                'skill_source'         => $isMySkill ? $mySkills[$sId]['source'] : 'untracked',
+                'is_my_skill'          => true,
+                'current_level'        => (int)($sk['current_level'] ?? 1),
+                'skill_source'         => $sk['skill_source'] ?? 'self_reported',
                 'is_career_required'   => $isCareerReq,
                 'career_required_level'=> $isCareerReq ? (int)$careerSkills[$sId]['required_level'] : 0,
-                'is_activity_linked'   => $isActLinked,
+                'is_activity_linked'   => ($sk['origin'] === 'student_existing_activities'),
                 'is_assessed'          => $hasAssessed,
                 'assessment_id'        => $hasAssessed ? (int)$latest['assessment_id'] : null,
                 'score'                => $score,
@@ -181,6 +235,9 @@ class AssessmentService
             $categorized[$cluster][] = $item;
         }
 
+        $summary['assessed_skills_count'] = $scoredCount;
+        $summary['pending_skills_count']  = max(0, count($allowedSkills) - $scoredCount);
+
         if ($scoredCount > 0) {
             $summary['average_score'] = round($totalScoreSum / $scoredCount, 1);
         }
@@ -188,7 +245,7 @@ class AssessmentService
         return [
             'summary'     => $summary,
             'categorized' => $categorized,
-            'all'         => $allSkills
+            'all'         => array_values($allowedSkills)
         ];
     }
 
@@ -218,11 +275,16 @@ class AssessmentService
     }
 
     /**
-     * Starts a new assessment session and persists generated questions
+     * Starts a new assessment session and persists generated questions along with a snapshot of assessed input
      */
-    public function createAssessmentSession(int $userId, int $skillId, array $questions): int
+    public function createAssessmentSession(int $userId, int $skillId, array $questions, array $snapshotContext = []): int
     {
-        // Find existing attempts count
+        // Enforce strict eligibility: Skill MUST be explicitly claimed or activity-linked
+        if (!$this->isSkillEligibleForAssessment($userId, $skillId)) {
+            throw new InvalidArgumentException("Skill ID {$skillId} is not in the student's claimed skills or verified activities.");
+        }
+
+        // Find existing attempts count for this skill
         $stmtCount = $this->db->prepare("
             SELECT COUNT(*) FROM ai_skill_assessments 
             WHERE user_id = :user_id AND skill_id = :skill_id
@@ -230,30 +292,65 @@ class AssessmentService
         $stmtCount->execute([':user_id' => $userId, ':skill_id' => $skillId]);
         $attemptNum = ((int)$stmtCount->fetchColumn()) + 1;
 
+        // Build immutable snapshot of the student's input at the time of assessment
+        $allowedSkills = $this->getStrictAllowedSkills($userId);
+        $skillInfo = $allowedSkills[$skillId] ?? ['skill_name' => 'Skill ' . $skillId, 'category_name' => 'General'];
+        $activities = $this->getStudentExistingActivitiesContext($userId);
+
+        $snapshot = [
+            'assessed_skill_id'     => $skillId,
+            'assessed_skill_name'   => $skillInfo['skill_name'] ?? '',
+            'assessed_category'     => $skillInfo['category_name'] ?? '',
+            'claimed_level'         => $skillInfo['current_level'] ?? 1,
+            'skill_source'          => $skillInfo['skill_source'] ?? 'self_reported',
+            'existing_activities'   => $activities,
+            'snapshot_timestamp'    => date('Y-m-d H:i:s'),
+            'extra_context'         => $snapshotContext
+        ];
+
+        $rubricVersion = '1.0';
+        $modelName = 'gemini-3.5-flash-lite';
+
         $this->db->beginTransaction();
         try {
             $stmtInsert = $this->db->prepare("
-                INSERT INTO ai_skill_assessments (user_id, skill_id, status, attempt_number, created_at)
-                VALUES (:user_id, :skill_id, 'in_progress', :attempt_number, NOW())
+                INSERT INTO ai_skill_assessments 
+                    (user_id, skill_id, status, attempt_number, rubric_version, model_name, snapshot_input_json, created_at)
+                VALUES 
+                    (:user_id, :skill_id, 'in_progress', :attempt_number, :rubric_version, :model_name, :snapshot_input_json, NOW())
             ");
             $stmtInsert->execute([
-                ':user_id'        => $userId,
-                ':skill_id'       => $skillId,
-                ':attempt_number' => $attemptNum
+                ':user_id'             => $userId,
+                ':skill_id'            => $skillId,
+                ':attempt_number'      => $attemptNum,
+                ':rubric_version'      => $rubricVersion,
+                ':model_name'          => $modelName,
+                ':snapshot_input_json' => json_encode($snapshot)
             ]);
             $assessmentId = (int)$this->db->lastInsertId();
 
             $stmtQ = $this->db->prepare("
-                INSERT INTO ai_assessment_questions (assessment_id, question_index, scenario_text, evaluation_criteria, created_at)
-                VALUES (:assessment_id, :question_index, :scenario_text, :evaluation_criteria, NOW())
+                INSERT INTO ai_assessment_questions 
+                    (assessment_id, question_index, scenario_text, evaluation_criteria, question_fingerprint, scenario_category, difficulty_level, created_at)
+                VALUES 
+                    (:assessment_id, :question_index, :scenario_text, :evaluation_criteria, :question_fingerprint, :scenario_category, :difficulty_level, NOW())
             ");
 
             foreach ($questions as $q) {
+                $scen = (string)($q['scenario'] ?? ($q['scenario_text'] ?? ''));
+                $criteria = (string)($q['evaluation_focus'] ?? ($q['evaluation_criteria'] ?? 'Practical Reasoning'));
+                $cat = (string)($q['scenario_category'] ?? ($snapshot['assessed_category'] ?? 'General'));
+                $diff = (string)($q['difficulty_level'] ?? 'intermediate');
+                $fp = $this->computeQuestionFingerprint($scen);
+
                 $stmtQ->execute([
-                    ':assessment_id'      => $assessmentId,
-                    ':question_index'     => (int)$q['index'],
-                    ':scenario_text'      => (string)$q['scenario'],
-                    ':evaluation_criteria'=> (string)($q['evaluation_focus'] ?? 'Practical Reasoning')
+                    ':assessment_id'       => $assessmentId,
+                    ':question_index'      => (int)($q['index'] ?? ($q['question_index'] ?? 1)),
+                    ':scenario_text'       => $scen,
+                    ':evaluation_criteria' => $criteria,
+                    ':question_fingerprint'=> $fp,
+                    ':scenario_category'   => $cat,
+                    ':difficulty_level'    => $diff
                 ]);
             }
 
@@ -429,7 +526,55 @@ class AssessmentService
                 ':level'    => $derivedLevel
             ]);
 
+            // 5. Synchronize with assessment_attempts & attempt_skill_scores for Dashboard & Module integration
+            $stmtGoal = $this->db->prepare("SELECT career_id FROM student_career_goals WHERE user_id = :user_id AND is_primary = 1 LIMIT 1");
+            $stmtGoal->execute([':user_id' => $userId]);
+            $careerId = (int)$stmtGoal->fetchColumn();
+            if ($careerId <= 0) {
+                $careerId = 4; // Default Software Developer if none set
+            }
+
+            $stmtAttempt = $this->db->prepare("
+                INSERT INTO assessment_attempts (user_id, assessment_id, career_id, status, started_at, submitted_at, score_pct)
+                VALUES (:user_id, 1, :career_id, 'submitted', NOW(), NOW(), :score_pct)
+            ");
+            $stmtAttempt->execute([
+                ':user_id'   => $userId,
+                ':career_id' => $careerId,
+                ':score_pct' => $overallScore
+            ]);
+            $attemptId = (int)$this->db->lastInsertId();
+
+            if ($attemptId > 0) {
+                $stmtScore = $this->db->prepare("
+                    INSERT INTO attempt_skill_scores (attempt_id, skill_id, method, correct_count, total_count, score_pct, derived_level, feedback)
+                    VALUES (:attempt_id, :skill_id, 'self_rubric', 5, 5, :score_pct, :derived_level, :feedback)
+                ");
+                $stmtScore->execute([
+                    ':attempt_id'    => $attemptId,
+                    ':skill_id'      => $skillId,
+                    ':score_pct'     => $overallScore,
+                    ':derived_level' => $derivedLevel,
+                    ':feedback'      => substr($aiFeedback, 0, 390)
+                ]);
+            }
+
             $this->db->commit();
+
+            // Notify student in-app that assessment results are ready
+            if (file_exists(__DIR__ . '/notification_service.php')) {
+                require_once __DIR__ . '/notification_service.php';
+                createNotification(
+                    $this->db,
+                    $userId,
+                    'assessment_completed',
+                    'Skill Assessment Evaluated',
+                    "Your AI skill assessment has been evaluated. Review your verified diagnostic report.",
+                    "assessment_results.php?id={$assessmentId}",
+                    "asmt_completed_{$assessmentId}_u{$userId}"
+                );
+            }
+
             return true;
         } catch (Exception $e) {
             $this->db->rollBack();
@@ -471,7 +616,183 @@ class AssessmentService
 
         $stmt = $this->db->prepare($sql);
         $stmt->execute($params);
-        return $stmt->fetchAll();
+        $history = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Calculate improvement delta compared with previous attempt for the same skill
+        // Group by skill_id in chronological order
+        $bySkill = [];
+        foreach ($history as $idx => $row) {
+            $sId = (int)$row['skill_id'];
+            $bySkill[$sId][] = $idx;
+        }
+
+        foreach ($bySkill as $sId => $indexes) {
+            // $indexes are sorted newest to oldest because of ORDER BY completed_at DESC
+            $count = count($indexes);
+            for ($i = 0; $i < $count; $i++) {
+                $currIdx = $indexes[$i];
+                $history[$currIdx]['score_delta'] = null;
+                $history[$currIdx]['score_delta_label'] = 'Baseline Attempt';
+                
+                // Compare with older attempt if one exists
+                if ($i + 1 < $count) {
+                    $prevIdx = $indexes[$i + 1];
+                    $prevScore = (float)$history[$prevIdx]['overall_score'];
+                    $currScore = (float)$history[$currIdx]['overall_score'];
+                    $delta = round($currScore - $prevScore, 1);
+                    $history[$currIdx]['score_delta'] = $delta;
+                    if ($delta > 0) {
+                        $history[$currIdx]['score_delta_label'] = "+{$delta}% vs Attempt #" . $history[$prevIdx]['attempt_number'];
+                    } elseif ($delta < 0) {
+                        $history[$currIdx]['score_delta_label'] = "{$delta}% vs Attempt #" . $history[$prevIdx]['attempt_number'];
+                    } else {
+                        $history[$currIdx]['score_delta_label'] = "Same score as Attempt #" . $history[$prevIdx]['attempt_number'];
+                    }
+                }
+            }
+        }
+
+        return $history;
+    }
+
+    /**
+     * Retrieves all previous questions asked to the student for a given skill across all attempts.
+     */
+    public function getStudentPreviousQuestions(int $userId, int $skillId): array
+    {
+        $stmt = $this->db->prepare("
+            SELECT 
+                q.id AS question_id,
+                q.assessment_id,
+                q.question_index,
+                q.scenario_text,
+                q.evaluation_criteria,
+                q.question_fingerprint,
+                q.scenario_category,
+                q.difficulty_level,
+                a.attempt_number,
+                a.status AS assessment_status,
+                q.created_at
+            FROM ai_assessment_questions q
+            JOIN ai_skill_assessments a ON q.assessment_id = a.id
+            WHERE a.user_id = :user_id 
+              AND a.skill_id = :skill_id
+            ORDER BY a.attempt_number DESC, q.question_index ASC
+        ");
+        $stmt->execute([':user_id' => $userId, ':skill_id' => $skillId]);
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    /**
+     * Computes a normalized SHA-256 fingerprint for a question scenario.
+     */
+    public function computeQuestionFingerprint(string $text): string
+    {
+        $normalized = strtolower(trim($text));
+        $normalized = preg_replace('/[^\w\s]/u', '', $normalized);
+        $normalized = preg_replace('/\s+/', ' ', $normalized);
+        $stopWords = ['the','a','an','is','in','at','of','on','and','or','for','to','with','you','your','would','how','what','are','can','could','this','that','from','into','about','their','there','team','work','project','handle','situation','describe','steps'];
+        $words = explode(' ', $normalized);
+        $filtered = [];
+        foreach ($words as $w) {
+            if (strlen($w) > 2 && !in_array($w, $stopWords, true)) {
+                $filtered[] = $w;
+            }
+        }
+        return hash('sha256', implode(' ', $filtered));
+    }
+
+    /**
+     * Extracts meaningful content word tokens for semantic similarity checking.
+     */
+    public function extractMeaningfulTokens(string $text): array
+    {
+        $normalized = strtolower(trim($text));
+        $normalized = preg_replace('/[^\w\s]/u', '', $normalized);
+        $words = preg_split('/\s+/', $normalized, -1, PREG_SPLIT_NO_EMPTY);
+        $stopWords = ['the','a','an','is','in','at','of','on','and','or','for','to','with','you','your','would','how','what','are','can','could','this','that','from','into','about','their','there','team','work','project','handle','situation','describe','steps'];
+        $tokens = [];
+        foreach ($words as $w) {
+            if (strlen($w) > 2 && !in_array($w, $stopWords, true)) {
+                $tokens[] = $w;
+            }
+        }
+        return array_values(array_unique($tokens));
+    }
+
+    /**
+     * Checks if a candidate question is an exact duplicate or close paraphrase of any previous question.
+     */
+    public function isQuestionDuplicate(string $candidateText, array $previousQuestions, float $similarityThreshold = 0.55): bool
+    {
+        if (empty($previousQuestions)) {
+            return false;
+        }
+
+        $candidateFp = $this->computeQuestionFingerprint($candidateText);
+        $candidateTokens = $this->extractMeaningfulTokens($candidateText);
+
+        foreach ($previousQuestions as $prev) {
+            $prevText = (string)($prev['scenario_text'] ?? ($prev['scenario'] ?? ''));
+            if (empty($prevText)) continue;
+
+            // 1. Exact or fingerprint match
+            $prevFp = !empty($prev['question_fingerprint']) ? $prev['question_fingerprint'] : $this->computeQuestionFingerprint($prevText);
+            if ($candidateFp === $prevFp) {
+                return true;
+            }
+
+            // 2. Jaccard token overlap to catch paraphrases
+            $prevTokens = $this->extractMeaningfulTokens($prevText);
+            if (!empty($candidateTokens) && !empty($prevTokens)) {
+                $intersection = array_intersect($candidateTokens, $prevTokens);
+                $union = array_unique(array_merge($candidateTokens, $prevTokens));
+                if (!empty($union)) {
+                    $similarity = count($intersection) / count($union);
+                    if ($similarity >= $similarityThreshold) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Saves or updates a student's answer for a single question in the conversational assessment.
+     */
+    public function saveAssessmentAnswer(int $assessmentId, int $questionId, string $answerText, ?float $score = null, ?string $feedback = null): bool
+    {
+        $stmtCheck = $this->db->prepare("SELECT id FROM ai_assessment_answers WHERE assessment_id = :aid AND question_id = :qid LIMIT 1");
+        $stmtCheck->execute([':aid' => $assessmentId, ':qid' => $questionId]);
+        $existingId = $stmtCheck->fetchColumn();
+
+        if ($existingId) {
+            $stmtUp = $this->db->prepare("
+                UPDATE ai_assessment_answers 
+                SET answer_text = :ans, score = :score, feedback = :fb 
+                WHERE id = :id
+            ");
+            return $stmtUp->execute([
+                ':ans'   => trim($answerText),
+                ':score' => $score,
+                ':fb'    => $feedback,
+                ':id'    => $existingId
+            ]);
+        } else {
+            $stmtIns = $this->db->prepare("
+                INSERT INTO ai_assessment_answers (assessment_id, question_id, answer_text, score, feedback, created_at)
+                VALUES (:aid, :qid, :ans, :score, :fb, NOW())
+            ");
+            return $stmtIns->execute([
+                ':aid'   => $assessmentId,
+                ':qid'   => $questionId,
+                ':ans'   => trim($answerText),
+                ':score' => $score,
+                ':fb'    => $feedback
+            ]);
+        }
     }
 
     /**

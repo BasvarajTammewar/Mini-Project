@@ -47,8 +47,10 @@ if (empty($geminiApiKey)) {
 
 return [
     'api_key'      => $geminiApiKey,
-    'model'        => 'gemini-1.5-flash',
-    'api_url'      => 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent',
+    'model'        => 'gemini-3.5-flash-lite',
+    'api_url'      => 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent',
+    'fallback_model' => 'gemini-3.5-flash',
+    'fallback_url'   => 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent',
     'timeout_sec'  => 30,
     'max_retries'  => 2,
     

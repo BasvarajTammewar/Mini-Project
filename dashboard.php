@@ -344,6 +344,17 @@ $stmtGaps = $db->prepare("
 $stmtGaps->execute([':user_id' => $userId]);
 $skillGaps = $stmtGaps->fetchAll();
 
+// Augment with AI Skill-Gap Analyses from Module 7
+$stmtAiGaps = $db->prepare("
+    SELECT ga.*, s.name AS skill_name, s.skill_type
+    FROM ai_skill_gap_analyses ga
+    JOIN skills s ON ga.skill_id = s.id
+    WHERE ga.user_id = :user_id
+    ORDER BY ga.updated_at DESC
+");
+$stmtAiGaps->execute([':user_id' => $userId]);
+$aiGaps = $stmtAiGaps->fetchAll(PDO::FETCH_ASSOC);
+
 $strongSkills = [];
 $improvingSkills = [];
 $missingSkills = [];
@@ -358,48 +369,92 @@ foreach ($skillGaps as $gap) {
     }
 }
 
+// Incorporate Module 7 AI Gap results if legacy recommendation runs not populated
+if (empty($skillGaps) && !empty($aiGaps)) {
+    foreach ($aiGaps as $aGap) {
+        $gStat = $aGap['gap_status'];
+        $item = [
+            'skill_name'     => $aGap['skill_name'],
+            'classification' => ($gStat === 'proficient') ? 'strong' : 'needs_improvement',
+            'gap'            => ($gStat === 'proficient') ? 0 : (($gStat === 'moderate_gap') ? 1 : 2)
+        ];
+        if ($gStat === 'proficient') {
+            $strongSkills[] = $item;
+        } else {
+            $improvingSkills[] = $item;
+        }
+        $skillGaps[] = $item;
+    }
+}
+
 // ============================================================================
 // 8. RETRIEVE ACTIVITY RECOMMENDATIONS PREVIEW (SECTION 12)
+// Module 8 Personalized Categories with Legacy Run Fallback
 // ============================================================================
-$stmtRec = $db->prepare("
+$stmtMod8 = $db->prepare("
     SELECT 
-        ar.rank_no,
-        ar.total_score,
-        ar.reason,
-        a.id AS activity_id,
-        a.title AS activity_title,
-        a.delivery_mode,
-        a.difficulty,
-        s.name AS related_skill_name
-    FROM activity_recommendations ar
-    JOIN recommendation_runs rr ON ar.run_id = rr.id
-    JOIN activities a ON ar.activity_id = a.id
-    LEFT JOIN skills s ON ar.primary_skill_id = s.id
-    WHERE rr.user_id = :user_id
-    ORDER BY rr.id DESC, ar.rank_no ASC
+        spr.rank_priority AS rank_no,
+        spr.relevance_label,
+        spr.category_code,
+        spr.why_recommended AS reason,
+        spr.target_gap_skill_name AS related_skill_name,
+        spr.verified_opps_count,
+        ac.id AS category_id,
+        ac.name AS activity_title
+    FROM student_personalized_recommendations spr
+    JOIN activity_categories ac ON spr.category_id = ac.id
+    WHERE spr.user_id = :user_id
+    ORDER BY spr.rank_priority ASC
     LIMIT 4
 ");
-$stmtRec->execute([':user_id' => $userId]);
-$recommendations = $stmtRec->fetchAll();
+$stmtMod8->execute([':user_id' => $userId]);
+$mod8Recs = $stmtMod8->fetchAll();
+
+if (!empty($mod8Recs)) {
+    $recommendations = [];
+    foreach ($mod8Recs as $m) {
+        $recommendations[] = [
+            'rank_no'            => $m['rank_no'],
+            'total_score'        => 95,
+            'reason'             => $m['reason'],
+            'activity_id'        => null,
+            'category_code'      => $m['category_code'],
+            'activity_title'     => $m['activity_title'],
+            'delivery_mode'      => 'Online / Hybrid',
+            'difficulty'         => 'Intermediate',
+            'related_skill_name' => $m['related_skill_name'] ?: 'Target Skill',
+            'is_category'        => true
+        ];
+    }
+} else {
+    $stmtRec = $db->prepare("
+        SELECT 
+            ar.rank_no,
+            ar.total_score,
+            ar.reason,
+            a.id AS activity_id,
+            a.title AS activity_title,
+            a.delivery_mode,
+            a.difficulty,
+            s.name AS related_skill_name
+        FROM activity_recommendations ar
+        JOIN recommendation_runs rr ON ar.run_id = rr.id
+        JOIN activities a ON ar.activity_id = a.id
+        LEFT JOIN skills s ON ar.primary_skill_id = s.id
+        WHERE rr.user_id = :user_id
+        ORDER BY rr.id DESC, ar.rank_no ASC
+        LIMIT 4
+    ");
+    $stmtRec->execute([':user_id' => $userId]);
+    $recommendations = $stmtRec->fetchAll();
+}
 
 // ============================================================================
 // 9. RETRIEVE NOTIFICATIONS (SECTION 15)
 // ============================================================================
-$stmtNotif = $db->prepare("
-    SELECT * FROM notifications 
-    WHERE user_id = :user_id 
-    ORDER BY created_at DESC 
-    LIMIT 5
-");
-$stmtNotif->execute([':user_id' => $userId]);
-$notifications = $stmtNotif->fetchAll();
-
-$unreadNotificationsCount = 0;
-foreach ($notifications as $n) {
-    if (empty($n['is_read'])) {
-        $unreadNotificationsCount++;
-    }
-}
+require_once __DIR__ . '/includes/notification_service.php';
+$unreadNotificationsCount = getUnreadNotificationCount($db, $userId);
+$notifications = getStudentNotifications($db, $userId, 5);
 
 // ============================================================================
 // 10. RETRIEVE EDUCATION DETAILS & INTERESTS FOR PROFILE SUMMARY (SECTION 8)
@@ -859,91 +914,84 @@ $stagesPercent = (int)round(($stagesCompletedCount / 8) * 100);
             <!-- Navigation Links -->
             <nav>
                 <ul class="sidebar-nav">
-                    <!-- 1. Dashboard -->
                     <li>
                         <a href="dashboard.php" class="nav-link active" aria-current="page">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect></svg>
                             <span>Dashboard</span>
                         </a>
                     </li>
-                    <!-- 2. My Profile -->
                     <li>
                         <a href="profile.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
                             <span>My Profile</span>
                         </a>
                     </li>
-                    <!-- 3. Career Exploration -->
                     <li>
                         <a href="career_goals.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg>
                             <span>Career Exploration</span>
                         </a>
                     </li>
-                    <!-- 4. My Skills -->
                     <li>
                         <a href="my_skills.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
                             <span>My Skills</span>
                         </a>
                     </li>
-                    <!-- 5. Skill Assessment -->
                     <li>
                         <a href="skills_assessment.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
                             <span>Skill Assessment</span>
                         </a>
                     </li>
-                    <!-- 6. Skill-Gap Analysis -->
                     <li>
                         <a href="skill_gap.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"></path><path d="M22 12A10 10 0 0 0 12 2v10z"></path></svg>
                             <span>Skill-Gap Analysis</span>
                         </a>
                     </li>
-                    <!-- 7. Recommendations -->
-                    <li>
-                        <a href="recommendations.php" class="nav-link">
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>
-                            <span>Recommendations</span>
-                        </a>
-                    </li>
-                    <!-- 8. Explore Activities -->
                     <li>
                         <a href="activities.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="M12 6v6l4 2"></path></svg>
                             <span>Explore Activities</span>
                         </a>
                     </li>
-                    <!-- 9. Saved Activities -->
+                    <li>
+                        <a href="roadmap.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+                            <span>Career Roadmap</span>
+                        </a>
+                    </li>
                     <li>
                         <a href="saved_activities.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
                             <span>Saved Activities</span>
                         </a>
                     </li>
-                    <!-- 10. My Enrollments -->
                     <li>
                         <a href="enrollments.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect><path d="M9 14l2 2 4-4"></path></svg>
                             <span>My Enrollments</span>
                         </a>
                     </li>
-                    <!-- 11. My Portfolio -->
                     <li>
                         <a href="portfolio.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>
                             <span>My Portfolio</span>
                         </a>
                     </li>
-                    <!-- 12. Resume Builder -->
                     <li>
                         <a href="resume.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
                             <span>Resume Builder</span>
                         </a>
                     </li>
-                    <!-- 13. Settings -->
+                    <li>
+                        <a href="notifications.php" class="nav-link">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
+                            <span>Notifications</span><?php if (!empty($unreadNotificationsCount) && $unreadNotificationsCount > 0): ?><span class="badge-pill danger" style="font-size:10px; padding:2px 6px; margin-left:auto; background:#EF4444; color:#fff; border-radius:10px;"><?= $unreadNotificationsCount ?></span><?php endif; ?>
+                        </a>
+                    </li>
                     <li>
                         <a href="settings.php" class="nav-link">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
@@ -1013,7 +1061,7 @@ $stagesPercent = (int)round(($stagesCompletedCount / 8) * 100);
                     <div class="notification-dropdown" id="notificationDropdownMenu" style="display: none;" role="menu">
                         <div class="dropdown-header">
                             <span>Notifications</span>
-                            <span style="font-size: 11px; font-weight: 600; color: #1769E8;"><?= count($notifications) ?> Total</span>
+                            <a href="notifications.php" style="font-size: 11px; font-weight: 600; color: #1769E8; text-decoration: none;">View All (<?= $unreadNotificationsCount ?> unread)</a>
                         </div>
                         <div class="notification-list">
                             <?php if (empty($notifications)): ?>
@@ -1023,15 +1071,23 @@ $stagesPercent = (int)round(($stagesCompletedCount / 8) * 100);
                                     <div style="font-size: 11.5px; color: #94A3B8; margin-top: 2px;">No new alerts or deadlines.</div>
                                 </div>
                             <?php else: ?>
+                                <div id="emptyNotifFallback" style="display: none; padding: 24px 16px; text-align: center; color: #667085; font-size: 13px;">
+                                    <div>You're all caught up!</div>
+                                    <div style="font-size: 11.5px; color: #94A3B8; margin-top: 2px;">No new alerts or deadlines.</div>
+                                </div>
                                 <?php foreach ($notifications as $notif): ?>
-                                    <div class="notification-item <?= empty($notif['is_read']) ? 'unread' : '' ?>">
+                                    <a href="<?= !empty($notif['link']) ? e($notif['link']) : 'notifications.php' ?>" class="notification-item <?= empty($notif['is_read']) ? 'unread' : '' ?>" style="text-decoration: none; display: flex;">
                                         <div style="flex: 1;">
-                                            <div style="font-weight: 600; color: #163A70;"><?= e($notif['message']) ?></div>
+                                            <div style="font-weight: 700; color: #163A70; font-size: 13px; margin-bottom: 2px;"><?= e($notif['title'] ?? 'Notification') ?></div>
+                                            <div style="font-size: 12px; color: #475569;"><?= e($notif['message']) ?></div>
                                             <div style="font-size: 11px; color: #94A3B8; margin-top: 3px;"><?= date('M j, Y • g:i A', strtotime($notif['created_at'])) ?></div>
                                         </div>
-                                    </div>
+                                    </a>
                                 <?php endforeach; ?>
                             <?php endif; ?>
+                        </div>
+                        <div style="padding: 8px 12px; background: #F8FAFC; border-top: 1px solid #E4EAF2; text-align: center;">
+                            <a href="notifications.php" style="font-size: 12px; font-weight: 600; color: #1769E8; text-decoration: none;">Go to Notification Center &rarr;</a>
                         </div>
                     </div>
                 </div>
@@ -1492,7 +1548,7 @@ $stagesPercent = (int)round(($stagesCompletedCount / 8) * 100);
                             <h2 class="section-main-heading">Skill-Gap Overview</h2>
                             <span class="section-sub-heading">Benchmarked against target career pathway</span>
                         </div>
-                        <a href="skill_gap.php" class="overview-card-link">View Skill-Gap Analysis &rarr;</a>
+                        <a href="skills_assessment.php?action=result" class="overview-card-link">View Skill-Gap in Assessment &rarr;</a>
                     </div>
 
                     <?php if (empty($skillGaps)): ?>
@@ -1529,7 +1585,7 @@ $stagesPercent = (int)round(($stagesCompletedCount / 8) * 100);
                             <h2 class="section-main-heading">Recommendations Preview</h2>
                             <span class="section-sub-heading">Curated extracurricular experiences</span>
                         </div>
-                        <a href="recommendations.php" class="overview-card-link">View All Recommendations &rarr;</a>
+                        <a href="skills_assessment.php?action=result#recommendations" class="overview-card-link">View Recommendations in Assessment &rarr;</a>
                     </div>
 
                     <?php if (empty($recommendations)): ?>
@@ -1540,6 +1596,7 @@ $stagesPercent = (int)round(($stagesCompletedCount / 8) * 100);
                             <a href="activities.php" class="btn-view-details" style="display:inline-flex;">Explore Catalog</a>
                         </div>
                     <?php else: ?>
+                        <div id="emptyRecsFallback" style="display:none;">Your personalized recommendations will appear here after skill-gap analysis.</div>
                         <div style="display: flex; flex-direction: column; gap: 10px;">
                             <?php foreach ($recommendations as $rec): ?>
                                 <div style="border: 1px solid #E4EAF2; border-radius: 8px; padding: 12px; background: #FAFCFF;">
@@ -1550,7 +1607,11 @@ $stagesPercent = (int)round(($stagesCompletedCount / 8) * 100);
                                     <div style="font-size: 12px; color: #667085; margin: 4px 0;"><?= e($rec['reason']) ?></div>
                                     <div style="display: flex; justify-content: space-between; font-size: 11px; color: #1769E8;">
                                         <span>Skill Target: <?= e($rec['related_skill_name'] ?? 'Core Competency') ?></span>
-                                        <a href="activities.php?id=<?= (int)$rec['activity_id'] ?>" style="font-weight: 700; text-decoration: none;">Details &rarr;</a>
+                                        <?php if (!empty($rec['category_code'])): ?>
+                                            <a href="activities.php?category=<?= urlencode((string)$rec['category_code']) ?>" style="font-weight: 700; text-decoration: none;">Explore &rarr;</a>
+                                        <?php else: ?>
+                                            <a href="activities.php?id=<?= (int)$rec['activity_id'] ?>" style="font-weight: 700; text-decoration: none;">Details &rarr;</a>
+                                        <?php endif; ?>
                                     </div>
                                 </div>
                             <?php endforeach; ?>
@@ -1583,6 +1644,7 @@ $stagesPercent = (int)round(($stagesCompletedCount / 8) * 100);
                             <a href="activities.php" class="btn-view-details" style="display:inline-flex;">Browse Activities</a>
                         </div>
                     <?php else: ?>
+                        <div id="emptyRecsFallback" style="display:none;">Your personalized recommendations will appear here after skill-gap analysis.</div>
                         <div style="display: flex; flex-direction: column; gap: 10px;">
                             <?php foreach (array_slice($allStudentActivities, 0, 4) as $act): ?>
                                 <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: #FAFCFF; border: 1px solid #E4EAF2; border-radius: 8px;">
@@ -1621,6 +1683,7 @@ $stagesPercent = (int)round(($stagesCompletedCount / 8) * 100);
                             <a href="portfolio.php" class="btn-view-details" style="display:inline-flex;">View Portfolio</a>
                         </div>
                     <?php else: ?>
+                        <div id="emptyRecsFallback" style="display:none;">Your personalized recommendations will appear here after skill-gap analysis.</div>
                         <div style="display: flex; flex-direction: column; gap: 10px;">
                             <?php foreach (array_slice($achievements, 0, 3) as $ach): ?>
                                 <div style="border: 1px solid #E4EAF2; border-radius: 8px; padding: 12px; background: #FAFCFF;">
