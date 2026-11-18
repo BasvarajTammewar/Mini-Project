@@ -5,3 +5,4 @@ $existingSkills = $db->query("SELECT id, category_id, code, name FROM skills ORD
 foreach ($existingSkills as $s) {
     echo "ID: {$s['id']} | Code: {$s['code']} | Name: {$s['name']} (Category ID: {$s['category_id']})\n";
 }
+

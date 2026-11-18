@@ -71,3 +71,4 @@ CREATE TABLE IF NOT EXISTS `biotech_activity_details` (
     UNIQUE KEY `uk_biotech_activity_id` (`activity_id`),
     CONSTRAINT `fk_bad_activity` FOREIGN KEY (`activity_id`) REFERENCES `activities` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+

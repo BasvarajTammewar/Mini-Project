@@ -24,3 +24,4 @@ print_r($skillCats);
 echo "\n=== ACTIVITY CATEGORIES ===\n";
 $actCats = $db->query("SELECT * FROM activity_categories")->fetchAll(PDO::FETCH_ASSOC);
 print_r($actCats);
+

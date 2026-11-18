@@ -5,3 +5,4 @@ $careers = $db->query("SELECT c.id, c.title, cs.name as subfield_name, cf.name a
 foreach ($careers as $c) {
     echo "ID: {$c['id']} | {$c['title']} (Field: {$c['field_name']} / {$c['subfield_name']})\n";
 }
+

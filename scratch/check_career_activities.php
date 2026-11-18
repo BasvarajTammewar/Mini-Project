@@ -5,3 +5,4 @@ $cols = $db->query("SHOW FULL COLUMNS FROM `career_activities`")->fetchAll(PDO::
 foreach ($cols as $c) {
     echo "  {$c['Field']} - {$c['Type']}\n";
 }
+

@@ -16,3 +16,4 @@ foreach ($tablesToInspect as $t) {
     }
     echo "\n";
 }
+

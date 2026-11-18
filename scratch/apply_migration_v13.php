@@ -11,3 +11,4 @@ foreach ($tables as $t) {
     $exists = $db->query("SHOW TABLES LIKE '$t'")->fetch();
     echo "- Table $t: " . ($exists ? "EXISTS" : "MISSING") . "\n";
 }
+

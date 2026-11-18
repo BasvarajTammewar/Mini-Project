@@ -5,3 +5,4 @@ $subfields = $db->query("SELECT cs.*, cf.name as field_name FROM career_subfield
 foreach ($subfields as $sf) {
     echo "Field: {$sf['field_name']} (ID: {$sf['field_id']}) -> Subfield: {$sf['name']} (ID: {$sf['id']})\n";
 }
+

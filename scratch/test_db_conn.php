@@ -6,3 +6,4 @@ try {
 } catch (Exception $e) {
     echo "DB ERROR: " . $e->getMessage() . "\n";
 }
+
